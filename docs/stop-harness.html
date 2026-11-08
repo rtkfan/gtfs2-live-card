@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Stop harness — gtfs2-stop-card</title>
+<style>
+  :root {
+    --card-background-color: #ffffff;
+    --primary-text-color: #212121;
+    --secondary-text-color: #727272;
+    --divider-color: rgba(0, 0, 0, 0.12);
+    --secondary-background-color: #fafafa;
+    --primary-color: #03a9f4;
+    --accent-color: #ff9800;
+    --error-color: #db4437;
+    --ha-card-border-radius: 12px;
+    --ha-card-border-color: #e0e0e0;
+    --page-bg: #fafafa;
+  }
+  :root.dark {
+    --card-background-color: #1c1c1c;
+    --primary-text-color: #e1e1e1;
+    --secondary-text-color: #9b9b9b;
+    --divider-color: rgba(225, 225, 225, 0.12);
+    --secondary-background-color: #202020;
+    --ha-card-border-color: #383838;
+    --page-bg: #111111;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: Roboto, "Segoe UI", system-ui, sans-serif;
+    background: var(--page-bg);
+    color: var(--primary-text-color);
+    -webkit-font-smoothing: antialiased;
+  }
+  #stage { padding: 20px; display: grid; gap: 18px; justify-content: center; align-content: start; }
+  .cell { display: flex; flex-direction: column; gap: 6px; }
+  .caption {
+    font-size: 13px; font-weight: 500; color: var(--secondary-text-color);
+    display: flex; align-items: center; gap: 7px; padding-left: 2px;
+  }
+  #fatal { color: #e01f1f; font: 13px monospace; white-space: pre-wrap; padding: 12px; }
+</style>
+</head>
+<body>
+<div id="fatal"></div>
+<div id="stage"></div>
+
+<script>
+/* Stubs of the Home Assistant elements the card touches. */
+const MDI = {
+  "mdi:bus": "M18,11H6V6H18M16.5,17A1.5,1.5 0 0,1 15,15.5A1.5,1.5 0 0,1 16.5,14A1.5,1.5 0 0,1 18,15.5A1.5,1.5 0 0,1 16.5,17M7.5,17A1.5,1.5 0 0,1 6,15.5A1.5,1.5 0 0,1 7.5,14A1.5,1.5 0 0,1 9,15.5A1.5,1.5 0 0,1 7.5,17M4,16C4,16.88 4.39,17.67 5,18.22V20A1,1 0 0,0 6,21H7A1,1 0 0,0 8,20V19H16V20A1,1 0 0,0 17,21H18A1,1 0 0,0 19,20V18.22C19.61,17.67 20,16.88 20,16V6C20,2.5 16.42,2 12,2C7.58,2 4,2.5 4,6V16Z",
+};
+
+class HaIcon extends HTMLElement {
+  static get observedAttributes() { return ["icon"]; }
+  connectedCallback() { this._render(); }
+  attributeChangedCallback() { this._render(); }
+  _render() {
+    const d = MDI[this.getAttribute("icon")] || MDI["mdi:bus"];
+    this.style.display = "inline-flex";
+    this.style.alignItems = "center";
+    this.style.justifyContent = "center";
+    this.innerHTML =
+      `<svg viewBox="0 0 24 24" style="width:var(--mdc-icon-size,24px);` +
+      `height:var(--mdc-icon-size,24px);fill:currentColor;display:block">` +
+      `<path d="${d}"/></svg>`;
+  }
+}
+customElements.define("ha-icon", HaIcon);
+
+class HaForm extends HTMLElement {
+  set schema(v) { this._schema = v; this._render(); }
+  set data(v) { this._data = v || {}; this._render(); }
+  set hass(v) { this._hass = v; }
+  set computeLabel(f) { this._label = f; this._render(); }
+  _render() {
+    if (!this._schema) return;
+    this.style.display = "grid";
+    this.style.gap = "14px";
+    this.style.padding = "6px 0";
+    this.innerHTML = "";
+    for (const field of this._schema) {
+      const kind = Object.keys(field.selector || {})[0] || "text";
+      const value = (this._data || {})[field.name];
+      const label = this._label ? this._label(field) : field.name;
+      this.appendChild(kind === "boolean" ? this._toggle(label, value) : this._input(label, value));
+    }
+  }
+  _shell(label) {
+    const box = document.createElement("div");
+    box.style.cssText =
+      "border-radius: 6px 6px 0 0; background: var(--secondary-background-color);" +
+      "border-bottom: 1px solid var(--secondary-text-color); padding: 8px 12px 6px;";
+    const cap = document.createElement("div");
+    cap.textContent = label;
+    cap.style.cssText = "font-size: 12px; color: var(--secondary-text-color); margin-bottom: 3px;";
+    box.appendChild(cap);
+    return box;
+  }
+  _input(label, value) {
+    const box = this._shell(label);
+    const val = document.createElement("div");
+    const shown = value === "" || value == null ? "—" : String(value);
+    val.textContent = shown;
+    val.style.cssText = "font-size: 15px; color: var(--primary-text-color); min-height: 20px;" +
+      (shown === "—" ? "opacity:.35;" : "");
+    box.appendChild(val);
+    return box;
+  }
+  _toggle(label, on) {
+    const row = document.createElement("div");
+    row.style.cssText = "display:flex; align-items:center; justify-content:space-between; gap:12px; padding: 2px 0;";
+    const cap = document.createElement("div");
+    cap.textContent = label;
+    cap.style.cssText = "font-size: 15px; color: var(--primary-text-color);";
+    const sw = document.createElement("div");
+    sw.style.cssText =
+      "width:36px; height:20px; border-radius:10px; position:relative; flex: none;" +
+      `background:${on ? "var(--primary-color)" : "var(--secondary-text-color)"};` +
+      (on ? "" : "opacity:.4;");
+    const knob = document.createElement("div");
+    knob.style.cssText =
+      "position:absolute; top:2px; width:16px; height:16px; border-radius:50%;" +
+      `background:#fff; ${on ? "right:2px" : "left:2px"};`;
+    sw.appendChild(knob);
+    row.append(cap, sw);
+    return row;
+  }
+}
+customElements.define("ha-form", HaForm);
+
+class HaCard extends HTMLElement {
+  connectedCallback() {
+    const s = this.style;
+    s.display = "block";
+    s.background = "var(--card-background-color)";
+    s.borderRadius = "var(--ha-card-border-radius, 12px)";
+    s.border = "1px solid var(--ha-card-border-color, rgba(0,0,0,0.12))";
+    s.color = "var(--primary-text-color)";
+    s.position = "relative";
+    s.overflow = "hidden";
+  }
+}
+customElements.define("ha-card", HaCard);
+</script>
+
+<!-- The real card, as shipped. -->
+<script type="module">
+import "../dist/stop/gtfs2-stop-card.js";
+
+const q = new URLSearchParams(location.search);
+const page = q.get("page") || "both";
+const dark = (q.get("mode") || "light") === "dark";
+const lang = q.get("lang") || "en";
+document.documentElement.classList.toggle("dark", dark);
+
+const fatal = (e) => {
+  document.getElementById("fatal").textContent += "\n" + (e?.stack || e);
+};
+window.addEventListener("error", (e) => fatal(e.message));
+window.addEventListener("unhandledrejection", (e) => fatal(e.reason));
+
+/* ── The fixture: one gtfs2 local-stop sensor, the exact attribute shape ──
+ * the integration publishes (verified against a live sensor), with every
+ * timestamp shifted so the first departure falls in two minutes. Two routes
+ * serve the stop; four vehicles ride the board's trips; one is a stale trip
+ * id from an earlier hour; one carries no trip id at all. */
+const SHIFT_MS = (120 - 0) * 1000;   // first departure 2 min out
+const iso = (offsetSec) => new Date(Date.now() + offsetSec * 1000).toISOString();
+const dep = (inSec, route, trip, headsign, delay = -86) => ({
+  departure: new Date(Date.now() + (inSec + delay) * 1000)
+    .toTimeString().slice(0, 5),
+  departure_datetime: iso(inSec),
+  departure_realtime: new Date(Date.now() + (inSec + delay) * 1000)
+    .toTimeString().slice(0, 5),
+  departure_realtime_datetime: iso(inSec + delay),
+  delay_realtime_derived: "-0:01:26",
+  delay_realtime: delay,
+  date: iso(0).slice(0, 10),
+  stop_name: "Northbound Main St @ E 18 Ave",
+  stop_id: "171",
+  route,
+  route_long: route === "003" ? "Main" : "Fraser",
+  headsign,
+  trip_id: trip,
+  direction_id: 0,
+  icon: "mdi:bus",
+});
+
+const deps = [
+  dep(120, "003", "15441234", "3 Main/To Waterfront Station"),
+  dep(720, "003", "15441235", "3 Main/To Waterfront Station", 240),
+  dep(1500, "003", "15441236", "3 Main/To Waterfront Station", 0),
+  dep(420, "015", "15452001", "15 Fraser/To Marine Drive Station", 90),
+  dep(2100, "015", "15452002", "15 Fraser/To Marine Drive Station", 0),
+];
+
+const states = {};
+const stopId = "sensor.gtfs2_home_departures_local_stop_zone_home";
+states[stopId] = {
+  entity_id: stopId,
+  state: deps[0].departure_realtime,
+  last_updated: new Date().toISOString(),
+  attributes: {
+    gtfs_updated_at: iso(0),
+    device_tracker_id: "zone.home",
+    offset: 0,
+    next_departures_lines: deps,
+    latitude: 49.255006,
+    longitude: -123.100984,
+    friendly_name: "GTFS - home-departures 171_local_stop_zone.home",
+  },
+};
+// a second stop, a couple of blocks south: the multi-stop board and the
+// nearby fallback have something to work with
+const stop2Id = "sensor.gtfs2_home_departures_local_stop_zone_home_2";
+states[stop2Id] = {
+  ...states[stopId],
+  entity_id: stop2Id,
+  attributes: {
+    ...states[stopId].attributes,
+    latitude: 49.254339,
+    longitude: -123.100959,
+    next_departures_lines: [dep(600, "003", "15441299", "3 Main/To Waterfront Station", 0)],
+    friendly_name: "GTFS - home-departures 170_local_stop_zone.home",
+  },
+};
+
+/* The positions file, as gtfs2 writes it: a FeatureCollection of Points,
+ * each vehicle's trip_id riding in the properties - what the board is
+ * joined on. */
+const pos = {
+  type: "FeatureCollection",
+  features: [
+    { type: "Feature", geometry: { type: "Point", coordinates: [-123.1015, 49.2562] },
+      properties: { id: "6613_0_2543", title: "003 → Waterfront Station @ Bay 3 2543_bus",
+        trip_id: "15441234", route_id: "6613", direction_id: 0,
+        vehicle_id: "2543", vehicle_label: "2543", bearing: 15 } },
+    { type: "Feature", geometry: { type: "Point", coordinates: [-123.1040, 49.2590] },
+      properties: { id: "6613_0_7103", title: "003 → Waterfront Station @ Bay 3 7103_bus",
+        trip_id: "15441235", route_id: "6613", direction_id: 0,
+        vehicle_id: "7103", vehicle_label: "7103", bearing: 170 } },
+    // a run gone for an hour: its trip id is back on the board tomorrow -
+    // today it must not be joined to the 12:xx departure that reuses it
+    { type: "Feature", geometry: { type: "Point", coordinates: [-123.0990, 49.2620] },
+      properties: { id: "6613_0_8800", title: "003 → Waterfront Station @ Bay 3 8800_bus",
+        trip_id: "15441236", route_id: "6613", direction_id: 0,
+        vehicle_id: "8800", vehicle_label: "8800", bearing: 270 } },
+    // route 015's bus, from its own file in real life; same body here
+    { type: "Feature", geometry: { type: "Point", coordinates: [-123.1025, 49.2530] },
+      properties: { id: "6627_0_9001", title: "015 → Marine Drive 9001_bus",
+        trip_id: "15452001", route_id: "6627", direction_id: 0,
+        vehicle_id: "9001", vehicle_label: "9001", bearing: 90 } },
+    // no trip id (the feed hiccupped, or a fresh block): the nearby
+    // fallback alone would keep it
+    { type: "Feature", geometry: { type: "Point", coordinates: [-123.1010, 49.2555] },
+      properties: { id: "6613_0_4242", title: "003 → Waterfront 4242_bus",
+        route_id: "6613", direction_id: 0,
+        vehicle_id: "4242", vehicle_label: "4242", bearing: 45 } },
+  ],
+};
+
+const realFetch = window.fetch;
+const json = (body) => Promise.resolve(new Response(JSON.stringify(body), {
+  status: 200, headers: { "Content-Type": "application/json" } }));
+window.fetch = (input, init) => {
+  const url = String(input?.url || input);
+  if (/6613_[01]\.json|6627_[01]\.json/.test(url)) return json(pos);
+  return realFetch(input, init);
+};
+
+/* ?moving=1: the feed is alive. Every two seconds each vehicle advances
+ * along its bearing; two of them (8800, 9001) lose their bearing after the
+ * first move, so their arrows can only come from the card's own reading of
+ * successive positions - the path a feed without bearing forces. */
+const moving = q.get("moving") === "1";
+window.__pos = pos;   // test probe
+if (moving) {
+  const step = (brg) => {
+    const rad = (brg * Math.PI) / 180;
+    return { dLat: 15 * Math.cos(rad) / 111320, dLon: 15 * Math.sin(rad) / (111320 * Math.cos(49.25 * Math.PI / 180)) };
+  };
+  const heads = new Map(pos.features.map((f) => [f.properties.vehicle_id, f.properties.bearing]));
+  setInterval(() => {
+    for (const f of pos.features) {
+      const id = f.properties.vehicle_id;
+      let brg = heads.get(id);
+      if (brg == null) continue;
+      if (id === "8800" || id === "9001") {
+        // one live fix with a bearing, then the feed "stops" exporting it:
+        // the card must keep the arrow from its own history
+        if (f.properties._moved) delete f.properties.bearing;
+      }
+      const { dLat, dLon } = step(brg);
+      f.geometry.coordinates[0] += dLon;
+      f.geometry.coordinates[1] += dLat;
+      f.properties._moved = true;
+      heads.set(id, brg);
+    }
+  }, 2000);
+}
+
+const hass = {
+  locale: { language: lang },
+  language: lang,
+  themes: { darkMode: dark },
+  states,
+  callService() {},
+};
+
+/* ── Pages ──────────────────────────────────────────────────────────────── */
+const stage = document.getElementById("stage");
+
+function card(config, caption, width) {
+  const cell = document.createElement("div");
+  cell.className = "cell";
+  if (width) cell.style.width = width + "px";
+  if (caption) {
+    const cap = document.createElement("div");
+    cap.className = "caption";
+    cap.textContent = caption;
+    cell.appendChild(cap);
+  }
+  const el = document.createElement("gtfs2-stop-card");
+  el.setConfig({ ...config });
+  el.hass = hass;
+  cell.appendChild(el);
+  stage.appendChild(cell);
+  return el;
+}
+
+const base = {
+  title: "Buses nearby",
+  stops: [stopId, stop2Id],
+  route_ids: { "003": "6613", "015": "6627" },
+  positions_url: "/local/gtfs2/6613_0.json",
+  refresh: moving ? 15 : 60,
+};
+
+if (page === "board") {
+  card({ ...base, show_map: false }, "board only", 470);
+} else if (page === "map") {
+  card({ ...base, show_departures: false, map_aspect: "4/3" }, "map only", 470);
+} else if (page === "nearby") {
+  card({ ...base, max_vehicles: "nearby", nearby_radius_km: 0.5 }, "nearby fallback", 470);
+} else {
+  card({ ...base, map_aspect: "4/3" }, "board + map", 470);
+}
+
+/* The announce, as the screenshots read it: ready once the card has laid
+ * itself out, with the height the frame must keep. ?settle=N seconds holds
+ * the announce back, so a driver can photograph the page after the buses
+ * have been moving for a while. */
+const settle = Number(q.get("settle") || 0) * 1000;
+const t0 = Date.now();
+let lastHeight = -1, stable = 0;
+const ready = () => {
+  const el = document.querySelector("gtfs2-stop-card");
+  const cardEl = el?.shadowRoot?.querySelector("ha-card");
+  return Date.now() - t0 >= settle && !document.getElementById("fatal").textContent
+    && cardEl && cardEl.getBoundingClientRect().height > 40;
+};
+setInterval(() => {
+  const el = document.querySelector("gtfs2-stop-card");
+  const cardEl = el?.shadowRoot?.querySelector("ha-card");
+  const h = cardEl ? Math.ceil(cardEl.getBoundingClientRect().height + 20) : 0;
+  if (ready() && h === lastHeight) stable += 1; else stable = 0;
+  lastHeight = h;
+  const late = stable < 3 || !ready();
+  document.title = `${late ? "late" : "ready"} ${innerWidth}x${h} — ` + document.title;
+}, 300);
+</script>
+</body>
+</html>
