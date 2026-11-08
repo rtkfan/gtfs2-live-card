@@ -108,20 +108,11 @@ const HIST_MAX = 30;
 // a departure rides the board this long past its time, then leaves - and
 // its vehicle with it
 const DEPART_GRACE_MS = 2 * 60000;
-const gtfsSecs = (v) => {
-    if (v == null) return null;
-    const m = String(v).match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
-    return m ? Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3] || 0) : null;
-};
 const HIST_TTL = 15 * 60000;  // forget vehicles gone from the feed this long
 const STALE_FEED = 8 * 60000;  // a positions file not rewritten this long = the source has gone quiet
 // realtime a sensor has not refreshed this long is no longer live: three of
 // gtfs2's default quarter hours missed
 const RT_STALE = 45 * 60000;
-// a run the feed struck out stays on the board this long past its time,
-// struck through: the rider who came for the 17:42 reads why it is not there
-// (see _areaFit): two towns, not two ends of one network
-const AREA_GAP_M = 50000;
 
 // One geometry for every corner mark a badge can carry, because a badge can
 // carry four of them and marks of different sizes in different corners would
@@ -791,7 +782,6 @@ class Gtfs2StopCard extends HTMLElement {
         this._ld = [];                    // per-line runtime: {geo, geoAt, err, route, routeAt, sig, sigAt}
         this._hist = new Map();           // "li:vid" → [{lat, lon, ts}]
         this._histSeen = new Map();       // "li:vid" → last time seen in the feed
-        this._vehCum = new Map();         // "li:vid" → last abscissa along the route (loop disambiguation)
         // per-entity derived metadata (positions file, label, color, origin
         // stop), persisted in localStorage: a line out of service loses its
         // Route/Trip attributes (sensor.remove_keys), and a page reload at
@@ -1405,7 +1395,10 @@ class Gtfs2StopCard extends HTMLElement {
             const slot = this._ld[def.idx];
             // no vehicles in the editor's preview: it shows the settings,
             // not the traffic
-            if (!def.positions_url || this._preview) continue;
+            if (this._preview) continue;
+            // a stop with neither an explicit positions_url nor a route_ids
+            // mapping for any of its routes has no vehicles to read
+            if (!def.positions_url && !this._positionsUrls(def).length) continue;
             // collapsed map only needs the count: poll five times slower
             const mapOff = this._collapsed.map || this._config.show_map === false;
             if (!force && mapOff && slot && Date.now() - (slot.geoAt || 0) < period * 5) continue;
@@ -2663,23 +2656,60 @@ class Gtfs2StopCard extends HTMLElement {
         if (this._built) this._renderHeader();
     }
 
+    // The positions files a stop reads: one per (route, direction) its
+    // departures ride, named the way gtfs2 names them - by the internal
+    // route id (route_ids maps the departure's route code to it), not by
+    // the code. An explicit positions_url on the stop stands in for them
+    // all. A route with no mapping, or a file gone empty, contributes
+    // nothing and is never an error.
+    _positionsUrls(def) {
+        if (def.positions_url) return [def.positions_url];
+        const map = this._config.route_ids && typeof this._config.route_ids === "object" ? this._config.route_ids : {};
+        const at = def.entity ? this._hass?.states?.[def.entity]?.attributes : null;
+        const out = [];
+        const seen = new Set();
+        for (const d of (Array.isArray(at?.next_departures_lines) ? at.next_departures_lines : [])) {
+            const rid = d?.route != null ? map[String(d.route).trim()] : null;
+            const dir = d?.direction_id;
+            if (rid == null || dir == null) continue;
+            const url = `/local/gtfs2/${safeFilePart(rid)}_${safeFilePart(dir)}.json`;
+            if (!seen.has(url)) { seen.add(url); out.push(url); }
+        }
+        return out;
+    }
+
     async _fetchPositions(def, force) {
         const slot = this._ld[def.idx];
         if (!slot) return;
         try {
             const maxAge = force ? FETCH_BURST_MS : Math.max(15, this._config.refresh) * 500;
-            slot.geo = await fetchJsonShared(def.positions_url, maxAge);
+            // every file the stop's routes are named by, merged into one
+            // FeatureCollection: the map and the join read them as one feed
+            const urls = this._positionsUrls(def);
+            const parts = await Promise.all(urls.map((u) => fetchJsonShared(u, maxAge).catch(() => null)));
+            const feats = [];
+            let lm = Infinity;
+            let ok = false;
+            for (const gj of parts) {
+                if (!gj) continue;
+                ok = true;
+                feats.push(...(gj.features || []));
+                const g = gj.__lastModified;
+                if (Number.isFinite(g)) lm = Math.min(lm, g);
+            }
+            slot.geo = ok ? { type: "FeatureCollection", features: feats } : null;
             slot.geoAt = Date.now();
-            slot.err = null;
+            slot.err = ok ? null : (urls.length ? "empty" : null);
             const now = Date.now();
-            // Freshness comes from the file's own Last-Modified when the server
-            // sends one: the integration rewrites the positions file on every
-            // update, so its date ages even while a parked vehicle keeps the
-            // contents identical. The position signature is the fallback for
-            // servers that send no date; on its own it cannot tell "no update
-            // since end of service" from "everyone is standing still".
-            const lm = slot.geo && slot.geo.__lastModified;
-            const sig = (slot.geo.features || []).map((f) => `${this._vid(f)}@${f.geometry?.coordinates}`).join("|");
+            // Freshness comes from the files' own Last-Modified when the
+            // server sends one: the integration rewrites the positions file
+            // on every update, so its date ages even while a parked vehicle
+            // keeps the contents identical. The position signature is the
+            // fallback for servers that send no date; on its own it cannot
+            // tell "no update since end of service" from "everyone is
+            // standing still".
+            lm = Number.isFinite(lm) ? lm : undefined;
+            const sig = feats.map((f) => `${this._vid(f)}@${f.geometry?.coordinates}`).join("|");
             if (Number.isFinite(lm)) {
                 slot.sig = sig;
                 slot.sigAt = Math.min(now, lm);
@@ -2701,7 +2731,7 @@ class Gtfs2StopCard extends HTMLElement {
             }
         } catch (e) {
             slot.geo = slot.geo || { features: [] };
-            if (slot.err !== String(e)) console.warn(`gtfs2-live-card: positions fetch failed (${def.positions_url})`, e);
+            if (slot.err !== String(e)) console.warn(`gtfs2-stop-card: positions fetch failed for ${def.entity || def.idx}`, e);
             slot.err = String(e);
         }
         // forget vehicles gone from this line's feed for a while. Outside the
@@ -2712,79 +2742,11 @@ class Gtfs2StopCard extends HTMLElement {
             if (key.startsWith(`${def.idx}:`) && (this._histSeen.get(key) || 0) < cutoff) {
                 this._hist.delete(key);
                 this._histSeen.delete(key);
-                this._vehCum.delete(key);
             }
         }
         this._scheduleRerender();
         this._renderFooter();
         this._repaintHeaderIfMuteChanged();
-    }
-
-    async _fetchRoute(def, force) {
-        const slot = this._ld[def.idx];
-        if (!slot || !def.route_url) return;
-        slot.routeAt = Date.now();
-        try {
-            const gj = await fetchJsonShared(def.route_url, force ? FETCH_BURST_MS : 5 * 60000);
-            const lineFeat = (gj.features || []).find((f) => f.geometry?.type === "LineString");
-            const stopFeats = (gj.features || []).filter((f) => f.geometry?.type === "Point");
-            // Newer gtfs2 exports carry the ordered stops alone, the polyline
-            // is ours to rebuild, stop_sequence giving the order. A LineString
-            // written by an older export stays honoured as is.
-            const lineCoords = lineFeat && Array.isArray(lineFeat.geometry.coordinates)
-                ? lineFeat.geometry.coordinates
-                : stopFeats
-                    .slice()
-                    .sort((a, b) => (a.properties?.stop_sequence ?? 0) - (b.properties?.stop_sequence ?? 0))
-                    .map((f) => f.geometry.coordinates);
-            if (lineCoords.length < 2) { slot.route = null; return; }
-            const line = lineCoords.map(([lon, lat]) => this._world(lat, lon));
-            const mPerU = this._mPerU(lineCoords[0][1]);
-            const cum = [0];
-            for (let i = 1; i < line.length; i++) {
-                cum.push(cum[i - 1] + Math.hypot(line[i].x - line[i - 1].x, line[i].y - line[i - 1].y) * mPerU);
-            }
-            let minCum = 0;
-            const stops = stopFeats
-                .sort((a, b) => (a.properties?.stop_sequence ?? 0) - (b.properties?.stop_sequence ?? 0))
-                .map((f) => {
-                    const [lon, lat] = f.geometry.coordinates;
-                    const w = this._world(lat, lon);
-                    // in stop order, never backwards: a loop serves the same
-                    // stop twice, and both visits used to land on whichever
-                    // leg was nearest, one of them wrong. The 30 m floor is
-                    // what pushes the second visit PAST the first - two real
-                    // stops are never that close, two visits of one are at 0
-                    const c = this._projectOnPolyline(w, line, cum, { prevCum: minCum + 30 / mPerU, tolU: 60 / mPerU }).cum;
-                    minCum = Math.max(minCum, c);
-                    return {
-                        ...w,
-                        id: String(f.properties?.stop_id || ""),
-                        name: String(f.properties?.stop_name || ""),
-                        seq: f.properties?.stop_sequence,
-                        cum: c,
-                        // the drawn trip's clock at this stop: what a journey
-                        // needs to time a point between two of its stops
-                        time: gtfsSecs(f.properties?.departure_time),
-                        // the line's word, over every run: no run ever takes
-                        // riders on here, or sets them down, when a gtfs2
-                        // that writes boards / alights says false. The drawn
-                        // run's own pickup_type says nothing of the others
-                        // and is not read; an older export says nothing at
-                        // all, and a stop it names stays a way on and off
-                        noBoard: f.properties?.boards === false,
-                        noAlight: f.properties?.alights === false,
-                    };
-                });
-            slot.route = { line, cum, stops, mPerU };
-            // a card of trips finds its ways on the stops of the shapes
-            this._routesGen = (this._routesGen || 0) + 1;
-        } catch (e) {
-            // route export absent (older gtfs2): the card degrades to traces
-            slot.route = null;
-        }
-        this._scheduleRerender();
-        this._scheduleBoard();
     }
 
     // The leg file: for every run the sensor lists, when its trip calls at
@@ -2811,17 +2773,6 @@ class Gtfs2StopCard extends HTMLElement {
         return { x, y };
     }
 
-    // latitude of anything the card already knows how to place, so the scale
-    // bar is right from the first paint anywhere on the globe, not just in
-    // the latitude band the card was first written for
-    _refLatFromStops() {
-        for (const slot of this._ld || []) {
-            const p = slot?.route?.stops?.[0] || slot?.route?.line?.[0];
-            if (p && Number.isFinite(p.y)) return this._latOf(p.y);
-        }
-        return null;
-    }
-
     // inverse Web-Mercator on the y axis: world units back to a latitude
     _latOf(y) {
         return (Math.atan(Math.sinh(Math.PI * (1 - (2 * y) / WORLD))) * 180) / Math.PI;
@@ -2831,104 +2782,6 @@ class Gtfs2StopCard extends HTMLElement {
         return (EARTH_CIRC * Math.cos((lat * Math.PI) / 180)) / WORLD;
     }
 
-    _projectOnPolyline(pt, line, cum, opts) {
-        let best = { d2: Infinity, cum: 0, point: line[0] || pt, idx: 0, t: 0 };
-        for (let i = 1; i < line.length; i++) {
-            const ax = line[i - 1].x, ay = line[i - 1].y;
-            const bx = line[i].x, by = line[i].y;
-            const dx = bx - ax, dy = by - ay;
-            const len2 = dx * dx + dy * dy;
-            const t = len2 ? Math.max(0, Math.min(1, ((pt.x - ax) * dx + (pt.y - ay) * dy) / len2)) : 0;
-            const px = ax + t * dx, py = ay + t * dy;
-            const d2 = (pt.x - px) ** 2 + (pt.y - py) ** 2;
-            if (d2 < best.d2) {
-                best = { d2, cum: cum[i - 1] + (cum[i] - cum[i - 1]) * t, point: { x: px, y: py }, idx: i - 1, t };
-            }
-        }
-        if (!opts || !line.length) return best;
-        // A loop line runs out and back along the same streets, so the shape
-        // passes a point TWICE and "nearest" is a coin toss between the legs.
-        // Picking the return leg for an outbound bus painted the whole route
-        // as already ridden, the user's own stop included. Collect every
-        // passage that comes close (one candidate per contiguous stretch of
-        // segments), then let what the caller knows decide: the vehicle's
-        // heading first - the two legs run opposite ways, so it settles them
-        // outright - then its previous progress along the route.
-        const lim = (Math.sqrt(best.d2) + (opts.tolU || 0)) ** 2;
-        const cands = [];
-        let cur = null;
-        for (let i = 1; i < line.length; i++) {
-            const ax = line[i - 1].x, ay = line[i - 1].y;
-            const bx = line[i].x, by = line[i].y;
-            const dx = bx - ax, dy = by - ay;
-            const len2 = dx * dx + dy * dy;
-            const t = len2 ? Math.max(0, Math.min(1, ((pt.x - ax) * dx + (pt.y - ay) * dy) / len2)) : 0;
-            const px = ax + t * dx, py = ay + t * dy;
-            const d2 = (pt.x - px) ** 2 + (pt.y - py) ** 2;
-            if (d2 > lim) continue;
-            if (cur && cur.end === i - 1) {
-                cur.end = i;
-                if (d2 < cur.d2) Object.assign(cur, { d2, cum: cum[i - 1] + (cum[i] - cum[i - 1]) * t, point: { x: px, y: py }, idx: i - 1, t });
-            } else {
-                cur = { d2, cum: cum[i - 1] + (cum[i] - cum[i - 1]) * t, point: { x: px, y: py }, idx: i - 1, t, end: i };
-                cands.push(cur);
-            }
-        }
-        let pool = cands;
-        if (opts.dir) {
-            const ahead = pool.filter((c) => {
-                const a = line[c.idx], b = line[c.idx + 1];
-                return (b.x - a.x) * opts.dir.x + (b.y - a.y) * opts.dir.y > 0;
-            });
-            if (ahead.length) pool = ahead;
-        }
-        if (opts.prevCum != null) {
-            const onward = pool.filter((c) => c.cum >= opts.prevCum - (opts.backU || 0));
-            if (onward.length) pool = onward;
-        }
-        let pick = pool[0] || best;
-        if (opts.prevCum != null && pool.length > 1) {
-            // several passages still in play: a vehicle advances, so the
-            // credible one is the SMALLEST step forward from where it was,
-            // not the geometrically nearest - nearest is the coin toss this
-            // whole branch exists to avoid
-            for (const c of pool) {
-                const jc = c.cum - opts.prevCum, jp = pick.cum - opts.prevCum;
-                if ((jc >= 0 && (jp < 0 || jc < jp)) || (jc < 0 && jp < 0 && jc > jp)) pick = c;
-            }
-        } else {
-            for (const c of pool) if (c.d2 < pick.d2) pick = c;
-        }
-        return pick;
-    }
-
-    // what the card knows about a vehicle, packaged for the projection: its
-    // heading over the last two positions (only once it has really moved -
-    // GPS jitter at a stop is not a heading), and how far along the route it
-    // was last time. Progress is remembered per vehicle so the split cannot
-    // leap between legs from one refresh to the next.
-    _projectVeh(li, vid, w, route) {
-        const key = `${li}:${vid}`;
-        const h = this._hist.get(key) || [];
-        let dir = null;
-        if (h.length > 1) {
-            const a = this._world(h[h.length - 2].lat, h[h.length - 2].lon);
-            const b = this._world(h[h.length - 1].lat, h[h.length - 1].lon);
-            const dx = b.x - a.x, dy = b.y - a.y;
-            const m = Math.hypot(dx, dy);
-            if (m * route.mPerU > 15) dir = { x: dx / m, y: dy / m };
-        }
-        const prev = this._vehCum.get(key);
-        const prj = this._projectOnPolyline(w, route.line, route.cum, {
-            dir,
-            prevCum: Number.isFinite(prev) ? prev : null,
-            tolU: 60 / route.mPerU,
-            backU: 250 / route.mPerU,
-        });
-        this._vehCum.set(key, prj.cum);
-        return prj;
-    }
-
     // Where a vehicle is drawn, and which way it heads: at its fix, always -
     // the fix is where the vehicle is. What it is on is its line's trip, so
     // it heads the way its line does at its projection (the loop-aware one
@@ -2936,6 +2789,9 @@ class Gtfs2StopCard extends HTMLElement {
     // to bend through it (see _bentRoute). A line with no shape heads from
     // the last two fixes. All of it kept per vehicle while its fix does not
     // move.
+    // Where a vehicle is drawn, and which way it heads. No route shape to
+    // project on: the heading is the feed's own bearing when it exports one,
+    // else the direction of the last two fixes once the bus has really moved.
     _placeVeh(e) {
         const vid = this._vid(e.f);
         const raw = this._world(e.f.geometry.coordinates[1], e.f.geometry.coordinates[0]);
@@ -2944,19 +2800,12 @@ class Gtfs2StopCard extends HTMLElement {
         e.w = raw;
         const pos = `${Math.round(raw.x)},${Math.round(raw.y)}`;
         const hit = this._angCache.get(key);
-        if (hit && hit.pos === pos) { e.angle = hit.a; e.prj = hit.prj; return; }
-        let angle = null, prj = null;
-        const route = this._ld[e.def.idx]?.route;
-        if (route) {
-            prj = this._projectVeh(e.def.idx, vid, raw, route);
-            angle = this._routeAngleAt(route, raw, prj, true);
-        }
-        if (angle == null) {
-            // the feed's own bearing, when gtfs2 exports one (compass
-            // degrees, north = 0, this heading is already drawn that way)
-            const br = Number(e.f.properties?.bearing);
-            if (Number.isFinite(br)) angle = ((br % 360) + 360) % 360;
-        }
+        if (hit && hit.pos === pos) { e.angle = hit.a; return; }
+        let angle = null;
+        // the feed's own bearing, when gtfs2 exports one (compass degrees,
+        // north = 0, and the heading is drawn that way too)
+        const br = Number(e.f.properties?.bearing);
+        if (Number.isFinite(br)) angle = ((br % 360) + 360) % 360;
         if (angle == null) {
             // from the last two fixes: only once the bus has really moved,
             // else a vehicle idling at the stop sprays arrows at every jitter
@@ -2970,9 +2819,8 @@ class Gtfs2StopCard extends HTMLElement {
                 angle = this._angCache.get(key)?.a ?? null;
             }
         }
-        this._angCache.set(key, { pos, a: angle, prj });
+        this._angCache.set(key, { pos, a: angle });
         e.angle = angle;
-        e.prj = prj;
     }
 
     // The vehicles the map shows: those running a departure on the board,
@@ -3035,154 +2883,6 @@ class Gtfs2StopCard extends HTMLElement {
             return stops.some((s) => haversine({ lat: co[1], lon: co[0] }, s) / 1000 < radius);
         };
     }
-
-    // A line's shape bent through its vehicles. The shape is the stops
-    // joined in riding order, straight across the blocks the streets go
-    // around; a vehicle between two stops is on the street the line really
-    // takes, so where the two disagree it is the shape that is wrong, not
-    // the fix. Each vehicle becomes a vertex of the polyline at its
-    // projection's abscissa - the line runs through the marker instead of
-    // beside it, and is still cut by abscissa, stops and slices unchanged.
-    // Returns a route-like {line, cum, mPerU, stops, pins}, pins giving the
-    // vertex index of each vehicle; the shape itself when no vehicle rides.
-    _bentRoute(route, vehs) {
-        const pins = vehs.filter((v) => v.prj).map((v) => ({ key: v.key, w: v.w, idx: v.prj.idx, t: v.prj.t, cum: v.prj.cum }))
-            .sort((a, b) => a.idx - b.idx || a.t - b.t);
-        if (!pins.length) return route;
-        const line = [], cum = [], at = new Map();
-        let p = 0;
-        for (let i = 0; i < route.line.length; i++) {
-            line.push(route.line[i]);
-            cum.push(route.cum[i]);
-            while (p < pins.length && pins[p].idx === i) {
-                at.set(pins[p].key, line.length);
-                line.push(pins[p].w);
-                cum.push(Math.max(cum[cum.length - 1], pins[p].cum));
-                p++;
-            }
-        }
-        return { line, cum, mPerU: route.mPerU, stops: route.stops, pins: at };
-    }
-
-    // heading (degrees, 0 = north, clockwise) of the route at the point's
-    // projection: the LineString follows the travel direction of the trip,
-    // so this is the correct arrow orientation by construction. Returns null
-    // when the point is too far from the route to trust it, unless onLine
-    // says the point belongs to the route whatever the distance.
-    _routeAngleAt(route, w, prj, onLine) {
-        prj = prj || this._projectOnPolyline(w, route.line, route.cum);
-        if (!onLine && Math.sqrt(prj.d2) * route.mPerU > 150) return null;
-        let i0 = prj.idx, i1 = Math.min(prj.idx + 1, route.line.length - 1);
-        let a = route.line[i0], b = route.line[i1];
-        let dx = b.x - a.x, dy = b.y - a.y;
-        if (!dx && !dy) {
-            if (i1 + 1 < route.line.length) { b = route.line[i1 + 1]; dx = b.x - a.x; dy = b.y - a.y; }
-            if (!dx && !dy) return null;
-        }
-        return (Math.atan2(dx, -dy) * 180) / Math.PI;
-    }
-
-    // small white arrowheads along a route, oriented in the travel direction
-    // (the shape follows the trip's stop order); this is what tells the two
-    // directions of a line apart at a glance
-    _routeArrows(route, relFn, u, spanM) {
-        const total = route.cum[route.cum.length - 1] || 0;
-        const step = Math.max(300, Math.min(3000, spanM / 10));
-        let svg = "", target = step / 2, i = 1, count = 0;
-        while (target < total && count < 60) {
-            while (i < route.line.length && route.cum[i] < target) i++;
-            if (i >= route.line.length) break;
-            const a = route.line[i - 1], b = route.line[i];
-            const segLen = route.cum[i] - route.cum[i - 1] || 1;
-            const t = (target - route.cum[i - 1]) / segLen;
-            const p = relFn({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
-            const ang = (Math.atan2(b.x - a.x, -(b.y - a.y)) * 180) / Math.PI;
-            svg += `<path d="M0 ${-4 * u} L${3.2 * u} ${3 * u} L0 ${1.4 * u} L${-3.2 * u} ${3 * u} Z" fill="var(--card-background-color, #fff)" opacity="0.9" transform="translate(${p.x.toFixed(3)} ${p.y.toFixed(3)}) rotate(${ang.toFixed(3)})"></path>`;
-            target += step;
-            count++;
-        }
-        return svg;
-    }
-
-    // The two ends of the selected/tracked line (topLi), each a stop of a
-    // shape tagged end: "start" or "end"; the neutral view stays minimal.
-    // The origin is looked for on the line's own shape, else on any other
-    // shape calling there, so its pin survives a shape not read yet; the
-    // destination only on its own shape, after the origin. An explicit
-    // latitude/longitude in the config is intentional and always shows.
-    // The ground the view fits when nothing is picked: every line's shape
-    // and vehicles. Lines far apart - a card holding Cannes and Orléans -
-    // are areas of their own, and fitting them all showed the whole of
-    // France and no street of either. The view fits one area: the one
-    // nearest the card's latitude and longitude when it sets them, else the
-    // one with the most lines, the first listed on a tie. A line of another
-    // area is a badge away. [{x, y}]
-    _areaFit(all, stations, mPerU) {
-        const gap = AREA_GAP_M / mPerU;
-        const boxOf = (pts) => ({ x0: Math.min(...pts.map((p) => p.x)), x1: Math.max(...pts.map((p) => p.x)),
-            y0: Math.min(...pts.map((p) => p.y)), y1: Math.max(...pts.map((p) => p.y)) });
-        const apart = (a, b) => Math.hypot(Math.max(0, a.x0 - b.x1, b.x0 - a.x1), Math.max(0, a.y0 - b.y1, b.y0 - a.y1));
-        let areas = [];
-        for (const def of this._lineDefs()) {
-            const pts = all.filter((e) => e.def.idx === def.idx).map((e) => e.w);
-            const route = this._ld[def.idx]?.route;
-            if (route) pts.push(...route.line);
-            if (pts.length) areas.push({ first: def.idx, n: 1, pts, box: boxOf(pts) });
-        }
-        // two areas closer than the gap are one, until none is
-        for (let merged = true; merged;) {
-            merged = false;
-            for (let i = 0; i < areas.length && !merged; i++) {
-                for (let j = i + 1; j < areas.length && !merged; j++) {
-                    if (apart(areas[i].box, areas[j].box) > gap) continue;
-                    const a = areas[i], b = areas[j];
-                    const pts = [...a.pts, ...b.pts];
-                    areas[i] = { first: Math.min(a.first, b.first), n: a.n + b.n, pts, box: boxOf(pts) };
-                    areas = areas.filter((_, k) => k !== j);
-                    merged = true;
-                }
-            }
-        }
-        if (areas.length < 2) return [...all.map((e) => e.w), ...stations, ...areas.flatMap((a) => a.pts)];
-        const home = this._config.latitude != null && this._config.longitude != null
-            ? this._world(Number(this._config.latitude), Number(this._config.longitude)) : null;
-        const dist = (a) => apart(a.box, { x0: home.x, x1: home.x, y0: home.y, y1: home.y });
-        const pick = areas.reduce((b, a) => {
-            if (home) return dist(a) < dist(b) ? a : b;
-            return a.n > b.n || (a.n === b.n && a.first < b.first) ? a : b;
-        });
-        return [...pick.pts, ...stations.filter((s) => apart(pick.box, { x0: s.x, x1: s.x, y0: s.y, y1: s.y }) <= gap)];
-    }
-
-    _stationPoints(topLi) {
-        const pts = [];
-        const seen = new Set();
-        if (topLi != null) {
-            for (const src of this._depSources()) {
-                if (!src.def || src.def.idx !== topLi) continue;
-                // the sensor's ends, remembered so an unavailable sensor
-                // (end of service) keeps them
-                const slice = this._legSlice(src.def, src.st);
-                const stops = slice.route?.stops || [];
-                let origin = slice.oFound ? stops[slice.oi] : null;
-                if (!origin && slice.oid) {
-                    for (const route of this._ld.map((s) => s.route).filter(Boolean)) {
-                        origin = route.stops?.find((s) => s.id === slice.oid || s.id.includes(slice.oid) || slice.oid.includes(s.id)) || null;
-                        if (origin) break;
-                    }
-                }
-                if (origin && !seen.has("o" + origin.id)) { seen.add("o" + origin.id); pts.push({ ...origin, end: "start" }); }
-                const dest = slice.dFound ? stops[slice.di] : null;
-                if (dest && !seen.has("d" + dest.id)) { seen.add("d" + dest.id); pts.push({ ...dest, end: "end" }); }
-            }
-        }
-        if (this._config.latitude != null && this._config.longitude != null) {
-            pts.push({ ...this._world(Number(this._config.latitude), Number(this._config.longitude)), end: "start" });
-        }
-        return pts;
-    }
-
-    /* ── PANE 2: MAP base map (MapLibre under the SVG) ──────────────────── */
 
     // what MapLibre is asked to draw: the theme's style, or the user's own -
     // a MapLibre style URL, or a raster {z}/{x}/{y} template wrapped into a
@@ -3410,9 +3110,12 @@ class Gtfs2StopCard extends HTMLElement {
             this.shadowRoot.getElementById("focus-panel").innerHTML = "";
             return;
         }
-        // positions are optional: a line that only knows its route shape
-        // still has a map worth drawing
-        if (!this._lineDefs().some((d) => d.positions_url || d.route_url)) {
+        // positions are optional: a stop with neither an explicit
+        // positions_url nor a route_ids mapping shows its stops alone once
+        // it has coordinates
+        const defs = this._lineDefs();
+        if (!defs.some((d) => d.positions_url) && !defs.some((d) => this._positionsUrls(d).length)
+            && !defs.some((d) => d.lat != null && d.lon != null)) {
             this._renderMapHead();
             this._clearMap(body, `<div class="empty">${this._t("no_source")}</div>`);
             return;
@@ -3477,14 +3180,21 @@ class Gtfs2StopCard extends HTMLElement {
         const lang = this._lang();
 
         // flatten features with their line def; a feed frozen for a while
-        // means the buses are ghosts (end of service): hide them
+        // means the buses are ghosts (end of service): hide them. Two stops
+        // sharing a route read the same file: a vehicle is drawn once, for
+        // the first stop that lists it
         const all = [];
         const nowMs = Date.now();
+        const seenVeh = new Set();
         for (const def of defs) {
             const slot = this._ld[def.idx];
             if (slot?.sigAt && nowMs - slot.sigAt > STALE_FEED) continue;
             for (const f of slot?.geo?.features || []) {
-                if (Array.isArray(f.geometry?.coordinates)) all.push({ f, def });
+                if (!Array.isArray(f.geometry?.coordinates)) continue;
+                const vk = `${f.properties?.route_id ?? ""}|${this._vid(f)}`;
+                if (seenVeh.has(vk)) continue;
+                seenVeh.add(vk);
+                all.push({ f, def });
             }
         }
         // where each vehicle is drawn, and which way it heads: see _placeVeh.
@@ -3520,58 +3230,19 @@ class Gtfs2StopCard extends HTMLElement {
         }
         // the count in the head is the vehicles drawn
         this._renderMapHead();
-        // each line's shape bent through the vehicles shown (see _bentRoute):
-        // what every stroke of a line is drawn from, its slices included
-        const bent = new Map();
-        for (const def of defs) {
-            const route = this._ld[def.idx]?.route;
-            if (route) bent.set(def.idx, this._bentRoute(route, all.filter((e) => e.def.idx === def.idx)));
-        }
-        let stations = this._stationPoints(topLi);
-        // the journey, drawn in the neutral view only: a line picked from its
-        // badge or a tracked vehicle shows that line whole, as it always did
-        const jGeo = !focusEntry && (topLi == null || this._journeys?.length) ? this._journeyGeometry(bent) : null;
-        // A line picked from its badge is picked whole. The journeys riding
-        // it keep their discs and their numbers, but a journey rides a
-        // stretch of the line, and fitting the view to that stretch alone
-        // left the rest of the line off screen - a line picked to be looked
-        // at, shown in part. So the ground the view must cover is the line's
-        // own, end to end, whatever the journeys on it ask for. A card
-        // without trips has no journey to fit: the lines its header leaves
-        // (a departure and an arrival picked) are fitted the same way, or
-        // the view kept every line of the card, Cannes and Orléans at once
-        const pickedFit = [];
-        const fitLines = this._hiLine != null ? new Set([this._hiLine]) : dset;
-        if (!focusEntry && fitLines?.size) {
-            for (const src of this._depSources()) {
-                if (!src.def || !fitLines.has(src.def.idx)) continue;
-                const s = this._legSlice(src.def, src.st);
-                const stops = s.route?.stops;
-                if (!stops || s.oi == null || s.di == null || s.di <= s.oi) continue;
-                pickedFit.push(...this._subRoute(bent.get(src.def.idx) || s.route,
-                    stops[s.oi].cum, stops[s.di].cum).line);
-            }
-        }
-        // a journey's own ends carry the words of departure and arrival: no
-        // station marker saying them a second time
-        if (jGeo) stations = [];
-        const anyRoute = this._ld.some((s) => s.route);
-        if (!all.length && !anyRoute && !stations.length) {
-            // nothing to draw at all: name the half that is missing. A route
-            // fetch already attempted and empty is the useful thing to say
-            // when the line publishes no positions to begin with.
+        // the stop card draws no route shapes: the ground is the stops
+        // themselves and the vehicles running the board's departures
+        const anyStop = defs.some((d) => d.lat != null && d.lon != null);
+        const posTried = this._ld.some((s) => s.geoAt);
+        if (!all.length && !anyStop && !posTried) {
             const posErr = this._ld.some((s) => s.err);
-            const posData = this._ld.some((s) => s.geoAt);
-            const routeTried = this._ld.some((s) => s.routeAt);
             const msg = posErr ? this._t("unreachable")
-                : posData ? this._busCountText(0)
-                : routeTried ? this._t("route_unreachable")
+                : posTried ? this._busCountText(0)
                 : this._t("loading");
             this._clearMap(body, `<div class="empty">${msg}</div>`);
             panel.innerHTML = "";
             return;
         }
-
         this._ensureMapDom(body);
         const svg = body.querySelector(".map-wrap svg");
         // one layout read for the whole render: the element cannot resize
@@ -3581,9 +3252,9 @@ class Gtfs2StopCard extends HTMLElement {
         const frameAspect = svgW ? Math.max(0.3, Math.min(1.4, svgH / svgW)) : 0.5;
 
         const refLat = all.length ? all[0].f.geometry.coordinates[1]
-            : this._config.latitude != null ? Number(this._config.latitude)
-            : this._refLatFromStops() ?? 47;
-        const mPerU = this._ld.find((s) => s.route)?.route.mPerU || this._mPerU(refLat);
+            : (this._lineDefs().find((d) => d.lat != null)?.lat
+                ?? (this._config.latitude != null ? Number(this._config.latitude) : 47));
+        const mPerU = this._mPerU(refLat);
         this._mPerUNow = mPerU;
 
         // target viewBox in ABSOLUTE world units; a manual pan/zoom wins
@@ -3596,20 +3267,11 @@ class Gtfs2StopCard extends HTMLElement {
             const w = 900 / mPerU, h = w * frameAspect;
             target = [c.x - w / 2, c.y - h * 0.6, w, h];
         } else {
-            let pts;
-            if (jGeo?.fit.length) {
-                // a journey fits its own ground: the ridden slices, the
-                // numbered points and the walks between them. Vehicles at the
-                // far end of a line are still drawn, off screen until the
-                // user pans there, rather than stretching the view to them
-                pts = [...jGeo.fit, ...stations, ...pickedFit];
-            } else if (pickedFit.length) {
-                // the board of lines has no journey to fit: a line picked
-                // there fits its own ground all the same, not the network's
-                pts = [...pickedFit, ...stations];
-            } else {
-                pts = this._areaFit(all, stations, mPerU);
-            }
+            // the ground the view covers: the stops and the vehicles shown.
+            // A vehicle far off still draws, off screen until the user pans
+            const stopPts = defs.filter((d) => d.lat != null && d.lon != null)
+                .map((d) => this._world(d.lat, d.lon));
+            const pts = [...stopPts, ...all.map((e) => e.w)];
             let minX = Math.min(...pts.map((p) => p.x)), maxX = Math.max(...pts.map((p) => p.x));
             let minY = Math.min(...pts.map((p) => p.y)), maxY = Math.max(...pts.map((p) => p.y));
             const padX = Math.max((maxX - minX) * 0.12, 300 / mPerU);
@@ -3691,261 +3353,71 @@ class Gtfs2StopCard extends HTMLElement {
         // ── base map: a theme flip or an edited map_style lands here
         this._applyBasemapStyle();
 
-        // ── routes (per line; passed/ahead split on the focused bus's line).
-        // SVG stacks in paint order: draw the "top" line LAST.
+        // ── the vehicles' recent paths: dotted, what the bus was seen along.
+        // No route shapes are drawn: this trail is the only history on the map
         let routeSvg = "";
         let nextStopName = null;
-        // connections: for each stop name, the configured lines serving it
-        // (keyed by badge label so both directions of a line count once)
-        const labelOf = new Map(defs.map((d) => [d.idx, this._lineLabelOf(d)]));
-        const links = new Map();
-        for (const def of defs) {
-            const r = this._ld[def.idx]?.route;
-            if (!r) continue;
-            for (const s of r.stops) {
-                if (!s.name) continue;
-                const k = s.name.trim().toLowerCase();
-                let m = links.get(k);
-                if (!m) { m = new Map(); links.set(k, m); }
-                if (!m.has(labelOf.get(def.idx))) m.set(labelOf.get(def.idx), def.color);
+        for (const e of all) {
+            const key = `${e.def.idx}:${this._vid(e.f)}`;
+            const h = this._hist.get(key) || [];
+            if (h.length > 1) {
+                const d = h.map((pt, i) => {
+                    const q = rel(this._world(pt.lat, pt.lon));
+                    return `${i ? "L" : "M"}${q.x.toFixed(3)} ${q.y.toFixed(3)}`;
+                }).join(" ");
+                const active = focusEntry ? focusEntry === e : (topLi == null || e.def.idx === topLi);
+                routeSvg += `<path d="${d}" fill="none" stroke="${esc(e.def.color || "#0072bc")}" stroke-width="${3 * u}" stroke-dasharray="${6 * u} ${6 * u}" opacity="${active ? 0.45 : 0.15}" stroke-linecap="round"></path>`;
             }
         }
-        this._stopLinks = links;
-        const hasLinks = (s, def) => {
-            const m = links.get((s.name || "").trim().toLowerCase());
-            return !!m && [...m.keys()].some((l) => l !== labelOf.get(def.idx));
-        };
-        // stop names show themselves when the map is zoomed in enough; one
-        // shared collision list across lines so shared stops label once
-        const labelsOn = spanM < LABEL_SPAN;
+
+        // ── the stops: a ring in the route's colour at the sensor's own
+        // coordinates, its name beside it on the clearest of four sides -
+        // kept clear of the vehicles and of the tracked popup's footprint
+        let stationSvg = "";
         const placed = [];
         this._shownLabels.clear();
         if (focusEntry) {
-            // the vehicle popup is an HTML box above the marker: reserve its
-            // footprint so no stop label gets drawn underneath it
             const pw = this._popSize?.w || 200;
             const ph = this._popSize?.h || 64;
             const bc = rel(focusEntry.w);
             placed.push({ x: bc.x - (pw / 2) * u, y: bc.y - (24 + ph) * u, w: pw * u, h: ph * u });
         }
-        // the ends of the line shown, or of the journey, say what they are
-        // at every zoom: a word beside the marker, the stop's name with it
-        // once the view is tight. Reserved first, so no stop label sits
-        // where the word goes; drawn last, above the overlay (further down)
-        const endLabels = [];
-        // vehicles sit above the overlay: the word goes to the side of the
-        // marker least covered by them at this refresh - right, left,
-        // above, below, the first clear one winning
-        const overlap = (b, list) => list.reduce((sum, o) => sum
-            + Math.max(0, Math.min(b.x + b.w, o.x + o.w) - Math.max(b.x, o.x))
-            * Math.max(0, Math.min(b.y + b.h, o.y + o.h) - Math.max(b.y, o.y)), 0);
         const vehBoxes = all.map((e) => {
             const q = rel(e.w);
             const r = (markerR + 3) * u;
             return { x: q.x - r, y: q.y - r, w: 2 * r, h: 2 * r };
         });
-        // a journey's ends wear D and A on their discs: their label is the
-        // stop's name alone, the word only while the name is unknown
-        const endLabel = (pos, kind, name, lettered) => {
-            const c = rel(pos);
-            const word = this._t(kind === "end" ? "map_end" : "map_start");
-            const nm = name ? String(name).trim() : "";
-            const both = (labelsOn || lettered) && !!nm;
-            let text = !both ? word : lettered ? nm : `${word} · ${nm}`;
-            const full = text.length <= 30;
-            if (!full) text = text.slice(0, 29).trimEnd() + "…";
-            const w = (text.length * 5.6 + 12) * u, h = 15 * u, gap = 13 * u;
-            const sides = [
-                { x: c.x + gap, y: c.y - h / 2, w, h },
-                { x: c.x - gap - w, y: c.y - h / 2, w, h },
-                { x: c.x - w / 2, y: c.y - gap - h, w, h },
-                { x: c.x - w / 2, y: c.y + gap, w, h },
-            ];
-            let box = sides[0], least = Infinity;
-            for (const b of sides) {
-                const pen = overlap(b, placed) + overlap(b, vehBoxes);
-                if (pen < least) { least = pen; box = b; }
-                if (!pen) break;
-            }
-            placed.push(box);
-            if (both && full) this._shownLabels.add(nm.toLowerCase());
-            endLabels.push({ box, text });
-        };
-        for (const st of stations) endLabel(st, st.end, st.name);
-        if (jGeo) for (const p of jGeo.points) if (p.kind === "start" || p.kind === "end") endLabel(p.pos, p.kind, p.name, true);
-        const routeDefs = topLi == null ? defs
-            : [...defs].sort((a, b) => (a.idx === topLi ? 1 : 0) - (b.idx === topLi ? 1 : 0));
-        for (const def of routeDefs) {
-            const route = this._ld[def.idx]?.route;
-            const color = def.color;
-            const isFocusLine = focusEntry && focusEntry.def.idx === def.idx;
-            // a picked line, or a picked journey, dims the lines it leaves out
-            const dimLine = (topLi != null && def.idx !== topLi) || (!!dset && !dset.has(def.idx))
-                || (!!jGeo && !!this._destView()?.narrowed && !jGeo.byLine.has(def.idx));
-            if (route) {
-                // the stroke follows the shape bent through the vehicles; the
-                // shape alone, with no vehicle on it, keeps its cached path
-                const shape = bent.get(def.idx) || route;
-                let dAll;
-                if (shape !== route) {
-                    dAll = shape.line.map((p, i) => `${i ? "L" : "M"}${((p.x - O.x) / SVG_UNIT).toFixed(3)} ${((p.y - O.y) / SVG_UNIT).toFixed(3)}`).join(" ");
-                } else if (route._dCache && route._dCache.ox === O.x && route._dCache.oy === O.y) {
-                    dAll = route._dCache.d;
-                } else {
-                    dAll = route.line.map((p, i) => `${i ? "L" : "M"}${((p.x - O.x) / SVG_UNIT).toFixed(3)} ${((p.y - O.y) / SVG_UNIT).toFixed(3)}`).join(" ");
-                    route._dCache = { ox: O.x, oy: O.y, d: dAll };
+        const overlap = (bx, list) => list.reduce((sum, o) => sum
+            + Math.max(0, Math.min(bx.x + bx.w, o.x + o.w) - Math.max(bx.x, o.x))
+            * Math.max(0, Math.min(bx.y + bx.h, o.y + o.h) - Math.max(bx.y, o.y)), 0);
+        for (const def of defs) {
+            if (def.lat == null || def.lon == null) continue;
+            const c = rel(this._world(def.lat, def.lon));
+            const color = def.color || "#0072bc";
+            stationSvg += `<circle cx="${c.x.toFixed(3)}" cy="${c.y.toFixed(3)}" r="${13 * u}" fill="${esc(color)}" opacity="0.2"></circle>`
+                + `<circle cx="${c.x.toFixed(3)}" cy="${c.y.toFixed(3)}" r="${9 * u}" fill="var(--card-background-color, #fff)" stroke="${esc(color)}" stroke-width="${3.5 * u}"></circle>`
+                + `<circle cx="${c.x.toFixed(3)}" cy="${c.y.toFixed(3)}" r="${3.2 * u}" fill="${esc(color)}"></circle>`;
+            const nm = String(def.label || def.stopName || "").trim();
+            if (nm) {
+                const text = nm.length <= 30 ? nm : nm.slice(0, 29).trimEnd() + "…";
+                const w = (text.length * 5.6 + 12) * u, h = 15 * u, gap = 13 * u;
+                const sides = [
+                    { x: c.x + gap, y: c.y - h / 2, w, h },
+                    { x: c.x - gap - w, y: c.y - h / 2, w, h },
+                    { x: c.x - w / 2, y: c.y - gap - h, w, h },
+                    { x: c.x - w / 2, y: c.y + gap, w, h },
+                ];
+                let box = sides[0], least = Infinity;
+                for (const bx of sides) {
+                    const pen = overlap(bx, placed) + overlap(bx, vehBoxes);
+                    if (pen < least) { least = pen; box = bx; }
+                    if (!pen) break;
                 }
-                if (isFocusLine) {
-                    const busW = focusEntry.w;
-                    const prj = focusEntry.prj || this._projectVeh(def.idx, this._vid(focusEntry.f), busW, route);
-                    // the split runs through the marker: the tracked vehicle
-                    // is a vertex of the bent shape, both halves meet on it
-                    const lineRel = shape.line.map(rel);
-                    const k = shape.pins?.get(focusEntry.key);
-                    const pr = rel(busW);
-                    const passed = lineRel.slice(0, k ?? prj.idx + 1).map((p, i) => `${i ? "L" : "M"}${p.x.toFixed(3)} ${p.y.toFixed(3)}`).join(" ") + ` L${pr.x.toFixed(3)} ${pr.y.toFixed(3)}`;
-                    const ahead = `M${pr.x.toFixed(3)} ${pr.y.toFixed(3)} ` + lineRel.slice(k != null ? k + 1 : prj.idx + 1).map((p) => `L${p.x.toFixed(3)} ${p.y.toFixed(3)}`).join(" ");
-                    routeSvg += `<path d="${passed}" fill="none" stroke="#8a9096" stroke-width="${3.5 * u}" stroke-dasharray="${7 * u} ${7 * u}" opacity="0.7" stroke-linecap="round"></path>`;
-                    routeSvg += `<path d="${ahead}" fill="none" stroke="${esc(color)}" stroke-width="${5 * u}" opacity="0.92" stroke-linecap="round"></path>`;
-                    const next = route.stops.find((s) => s.cum > prj.cum + 15);
-                    nextStopName = next?.name || null;
-                    for (const s of route.stops) {
-                        const p = rel(s);
-                        const ahead2 = s.cum > prj.cum;
-                        routeSvg += this._stopMarker(s, p, u, ahead2 ? esc(color) : "#8a9096", 4, hasLinks(s, def), def.idx, route);
-                    }
-                    if (next) {
-                        const p = rel(next);
-                        const labelW = (next.name.length * 6.2 + 16) * u;
-                        const nbox = { x: p.x - labelW / 2, y: p.y - 24 * u, w: labelW, h: 17 * u };
-                        const underPop = placed.some((b) => nbox.x < b.x + b.w && nbox.x + nbox.w > b.x && nbox.y < b.y + b.h && nbox.y + nbox.h > b.y);
-                        placed.push(nbox);
-                        if (!underPop) {
-                            routeSvg += `<g><rect x="${nbox.x.toFixed(3)}" y="${nbox.y.toFixed(3)}" width="${labelW.toFixed(3)}" height="${(17 * u).toFixed(3)}" rx="${(8.5 * u).toFixed(3)}" fill="var(--card-background-color, #fff)" opacity="0.95"></rect>
-                            ${svgText(p.x, p.y - 12 * u, 10, u, 'font-weight="500" fill="var(--primary-text-color, #212121)" text-anchor="middle"', esc(next.name))}</g>`;
-                        }
-                    }
-                    if (labelsOn) routeSvg += this._stopLabels(route.stops, rel, u, placed, next);
-                } else if (jGeo?.byLine.has(def.idx)) {
-                    // a journey line: the whole shape faint for context, the
-                    // ridden slice full, with its arrows, its stops and their
-                    // names; the points get their numbers further down
-                    routeSvg += `<path d="${dAll}" fill="none" stroke="${esc(color)}" stroke-width="${4.5 * u}" opacity="0.18" stroke-linecap="round"></path>`;
-                    for (const g of jGeo.byLine.get(def.idx)) {
-                        // the part of the leg the run shown does not ride,
-                        // dashed in grey like the way a tracked vehicle has
-                        // left behind, its stops grey: under the ridden slice
-                        for (const o of g.off) {
-                            const d = o.sub.line.map((p, i) => `${i ? "L" : "M"}${((p.x - O.x) / SVG_UNIT).toFixed(3)} ${((p.y - O.y) / SVG_UNIT).toFixed(3)}`).join(" ");
-                            routeSvg += `<path class="jskip" d="${d}" fill="none" stroke="#8a9096" stroke-width="${3.5 * u}" stroke-dasharray="${7 * u} ${7 * u}" opacity="0.7" stroke-linecap="round"></path>`;
-                            for (const s of o.stops) {
-                                if (!g.stops.includes(s)) routeSvg += this._stopMarker(s, rel(s), u, "#8a9096", 3.5, hasLinks(s, def), def.idx, route);
-                            }
-                        }
-                        const d = g.sub.line.map((p, i) => `${i ? "L" : "M"}${((p.x - O.x) / SVG_UNIT).toFixed(3)} ${((p.y - O.y) / SVG_UNIT).toFixed(3)}`).join(" ");
-                        routeSvg += `<path d="${d}" fill="none" stroke="${esc(color)}" stroke-width="${5 * u}" opacity="0.92" stroke-linecap="round"></path>`;
-                        routeSvg += this._routeArrows(g.sub, rel, u, spanM);
-                        for (const s of g.stops) {
-                            const p = rel(s);
-                            routeSvg += this._stopMarker(s, p, u, esc(color), 3.5, hasLinks(s, def), def.idx, route);
-                        }
-                        if (labelsOn) routeSvg += this._stopLabels(g.stops, rel, u, placed, null);
-                    }
-                } else {
-                    routeSvg += `<path d="${dAll}" fill="none" stroke="${esc(color)}" stroke-width="${4.5 * u}" opacity="${dimLine ? 0.18 : 0.9}" stroke-linecap="round"></path>`;
-                    if (!dimLine) {
-                        routeSvg += this._routeArrows(shape, rel, u, spanM);
-                        for (const s of route.stops) {
-                            const p = rel(s);
-                            routeSvg += this._stopMarker(s, p, u, esc(color), 3.5, hasLinks(s, def), def.idx, route);
-                        }
-                        if (labelsOn) routeSvg += this._stopLabels(route.stops, rel, u, placed, null);
-                    }
-                }
-            } else {
-                // no route export yet for this line: draw per-bus recent traces
-                for (const e of all) {
-                    if (e.def.idx !== def.idx) continue;
-                    const key = `${def.idx}:${this._vid(e.f)}`;
-                    const h = this._hist.get(key) || [];
-                    if (h.length > 1) {
-                        const d = h.map((p, i) => {
-                            const q = rel(this._world(p.lat, p.lon));
-                            return `${i ? "L" : "M"}${q.x.toFixed(3)} ${q.y.toFixed(3)}`;
-                        }).join(" ");
-                        const active = focusEntry
-                            ? (focusEntry.def.idx === def.idx && this._vid(focusEntry.f) === this._vid(e.f))
-                            : (topLi == null || def.idx === topLi);
-                        routeSvg += `<path d="${d}" fill="none" stroke="${esc(color)}" stroke-width="${3 * u}" stroke-dasharray="${6 * u} ${6 * u}" opacity="${active ? 0.45 : 0.15}" stroke-linecap="round"></path>`;
-                    }
-                }
+                placed.push(box);
+                stationSvg += `<g pointer-events="none"><rect x="${box.x.toFixed(3)}" y="${box.y.toFixed(3)}" width="${box.w.toFixed(3)}" height="${box.h.toFixed(3)}" rx="${(7.5 * u).toFixed(3)}" fill="var(--card-background-color, #fff)" stroke="${esc(color)}" stroke-width="${(1.2 * u).toFixed(3)}" opacity="0.95"></rect>`
+                    + svgText(box.x + 6 * u, box.y + box.h / 2 + 3.4 * u, 9.5, u, 'font-weight="700" fill="var(--primary-text-color, #212121)"', esc(text)) + "</g>";
             }
         }
-
-        // ── the line's ends (one pair per departure sensor), in the station
-        // colour: the start a hollow ring with a dot, the arrival a solid
-        // disc with a square inside, the way a terminus is drawn
-        let stationSvg = "";
-        const sc = this._stationColor();
-        for (const station of stations) {
-            const s = rel(station);
-            stationSvg += `<circle cx="${s.x.toFixed(3)}" cy="${s.y.toFixed(3)}" r="${13 * u}" fill="${esc(sc)}" opacity="0.2"></circle>`;
-            if (station.end === "end") {
-                stationSvg += `<circle cx="${s.x.toFixed(3)}" cy="${s.y.toFixed(3)}" r="${9 * u}" fill="${esc(sc)}" stroke="var(--card-background-color, #fff)" stroke-width="${2 * u}"></circle>
-                          <rect x="${(s.x - 3 * u).toFixed(3)}" y="${(s.y - 3 * u).toFixed(3)}" width="${6 * u}" height="${6 * u}" rx="${0.8 * u}" fill="var(--card-background-color, #fff)"></rect>`;
-            } else {
-                stationSvg += `<circle cx="${s.x.toFixed(3)}" cy="${s.y.toFixed(3)}" r="${9 * u}" fill="var(--card-background-color, #fff)" stroke="${esc(sc)}" stroke-width="${3.5 * u}"></circle>
-                          <circle cx="${s.x.toFixed(3)}" cy="${s.y.toFixed(3)}" r="${3.2 * u}" fill="${esc(sc)}"></circle>`;
-            }
-        }
-        // ── journey points: the walk of a change first (dotted, under the
-        // discs), then one numbered disc per point in the station colour
-        if (jGeo) {
-            const ink = inkOn(sc);
-            for (const w of jGeo.walks) {
-                const a = rel(w.from), b = rel(w.to);
-                stationSvg += `<path d="M${a.x.toFixed(3)} ${a.y.toFixed(3)} L${b.x.toFixed(3)} ${b.y.toFixed(3)}" fill="none" stroke="${esc(sc)}" stroke-width="${3 * u}" stroke-dasharray="${1 * u} ${6 * u}" stroke-linecap="round" opacity="0.9"></path>`;
-            }
-            // the other journeys' points first, so the numbered ones sit on top
-            for (const p of jGeo.others) {
-                const c = rel(p.pos);
-                stationSvg += `<g class="stop jpt" data-action="stop" data-li="${p.li}" data-name="${esc(p.name)}" data-x="${c.x.toFixed(3)}" data-y="${c.y.toFixed(3)}">
-                    <circle cx="${c.x.toFixed(3)}" cy="${c.y.toFixed(3)}" r="${14 * u}" fill="${esc(sc)}" opacity="0.2"></circle>
-                    <circle class="dot" cx="${c.x.toFixed(3)}" cy="${c.y.toFixed(3)}" r="${10 * u}" fill="${esc(sc)}" stroke="var(--card-background-color, #fff)" stroke-width="${2.5 * u}"></circle>
-                    ${this._alertPipSvg(this._stopAlertsAt(p.li, p.name), c.x + 4 * u, c.y - 4 * u, u, 10)}</g>`;
-            }
-            // points closer than a disc are one mark - a start next to the
-            // first stop, a change seen from afar - or the second hides the
-            // first: a pill saying the first number and the last
-            const groups = [];
-            for (const p of jGeo.points) {
-                const c = rel(p.pos);
-                const g = groups.find((q) => Math.hypot(q.c.x - c.x, q.c.y - c.y) < 20 * u);
-                if (g) g.pts.push(p); else groups.push({ c, pts: [p] });
-            }
-            for (const { c, pts } of groups) {
-                const p = pts[0];
-                const text = pts.length > 1 ? `${this._ptLabel(p)}–${this._ptLabel(pts[pts.length - 1])}` : this._ptLabel(p);
-                const name = [...new Set(pts.map((q) => q.name).filter(Boolean))].join(" / ");
-                const w = Math.max(20, 7 * text.length + 8) * u;
-                const halo = pts.length > 1
-                    ? `<rect x="${(c.x - w / 2 - 4 * u).toFixed(3)}" y="${(c.y - 14 * u).toFixed(3)}" width="${(w + 8 * u).toFixed(3)}" height="${(28 * u).toFixed(3)}" rx="${(14 * u).toFixed(3)}" fill="${esc(sc)}" opacity="0.2"></rect>`
-                        + `<rect class="dot" x="${(c.x - w / 2).toFixed(3)}" y="${(c.y - 10 * u).toFixed(3)}" width="${w.toFixed(3)}" height="${(20 * u).toFixed(3)}" rx="${(10 * u).toFixed(3)}" fill="${esc(sc)}" stroke="var(--card-background-color, #fff)" stroke-width="${2.5 * u}"></rect>`
-                    : `<circle cx="${c.x.toFixed(3)}" cy="${c.y.toFixed(3)}" r="${14 * u}" fill="${esc(sc)}" opacity="0.2"></circle>`
-                        + `<circle class="dot" cx="${c.x.toFixed(3)}" cy="${c.y.toFixed(3)}" r="${10 * u}" fill="${esc(sc)}" stroke="var(--card-background-color, #fff)" stroke-width="${2.5 * u}"></circle>`;
-                const pal = pts.map((q) => this._stopAlertsAt(q.li, q.name)).find(Boolean);
-                stationSvg += `<g class="stop jpt" data-action="stop" data-li="${p.li}" data-name="${esc(name)}" data-x="${c.x.toFixed(3)}" data-y="${c.y.toFixed(3)}">
-                    ${halo}
-                    ${svgText(c.x, c.y + 3.8 * u, 11, u, `font-weight="700" fill="${ink}" text-anchor="middle" pointer-events="none"`, esc(text))}
-                    ${this._alertPipSvg(pal, c.x + (pts.length > 1 ? w / 2 - 2 * u : 4 * u), c.y - 4 * u, u, 10)}</g>`;
-            }
-        }
-        // ── the ends' words, ringed in the station colour, above the markers
-        for (const l of endLabels) {
-            stationSvg += `<g pointer-events="none"><rect x="${l.box.x.toFixed(3)}" y="${l.box.y.toFixed(3)}" width="${l.box.w.toFixed(3)}" height="${l.box.h.toFixed(3)}" rx="${(7.5 * u).toFixed(3)}" fill="var(--card-background-color, #fff)" stroke="${esc(sc)}" stroke-width="${(1.2 * u).toFixed(3)}" opacity="0.95"></rect>`
-                + svgText(l.box.x + 6 * u, l.box.y + l.box.h / 2 + 3.4 * u, 9.5, u, 'font-weight="700" fill="var(--primary-text-color, #212121)"', esc(l.text)) + "</g>";
-        }
-
         // ── buses: top line's buses above the others, focused bus on top.
         // Vehicles live in persistent SVG nodes keyed by line + vehicle id
         // (see _syncVehicles): position and heading changes glide through a
@@ -4220,43 +3692,6 @@ class Gtfs2StopCard extends HTMLElement {
             ${terminus ? `<div class="pop-dest">→ ${esc(terminus)}</div>` : ""}
             ${showNext ? `<div class="pop-row">${this._t("next_stop", { s: esc(nextStopName) })}</div>` : ""}
             ${tele ? `<div class="pop-row">${tele}</div>` : ""}`;
-    }
-
-    // a stop: wide transparent hit area, the dot itself; connection stops
-    // (served by another configured line) drawn bigger with a thicker ring.
-    // The line's real ends - first and last stop of the shape, not where a
-    // journey gets on or off - are squares instead of rings
-    _stopMarker(s, p, u, stroke, baseR, hub, li, route) {
-        const r = (hub ? baseR + 1.6 : baseR) * u;
-        const sw = (hub ? 2.6 : 2) * u;
-        const st = route?.stops;
-        const term = !!st?.length && (s === st[0] || s === st[st.length - 1]);
-        const dot = term
-            ? `<rect class="dot" x="${(p.x - r).toFixed(3)}" y="${(p.y - r).toFixed(3)}" width="${(2 * r).toFixed(3)}" height="${(2 * r).toFixed(3)}" rx="${(0.6 * u).toFixed(3)}" fill="var(--card-background-color, #fff)" stroke="${stroke}" stroke-width="${sw}"></rect>`
-            : `<circle class="dot" cx="${p.x.toFixed(3)}" cy="${p.y.toFixed(3)}" r="${r.toFixed(3)}" fill="var(--card-background-color, #fff)" stroke="${stroke}" stroke-width="${sw}"></circle>`;
-        return `<g class="stop" data-action="stop" data-li="${li}" data-name="${esc(s.name)}" data-x="${p.x.toFixed(3)}" data-y="${p.y.toFixed(3)}">`
-            + `<circle cx="${p.x.toFixed(3)}" cy="${p.y.toFixed(3)}" r="${11 * u}" fill="transparent"></circle>`
-            + dot + this._alertPipSvg(this._stopAlertsAt(li, s.name), p.x, p.y, u, hub ? baseR + 1.6 : baseR) + `</g>`;
-    }
-
-    // automatic stop labels (zoomed-in views): right of the dot, skipped on
-    // collision with an already placed label
-    _stopLabels(stops, rel, u, placed, skip) {
-        let svg = "";
-        for (const s of stops) {
-            if (!s.name || s === skip) continue;
-            const p = rel(s);
-            const full = s.name.length <= 24;
-            const name = full ? s.name : s.name.slice(0, 23).trimEnd() + "…";
-            const w = (name.length * 5.4 + 10) * u, h = 14 * u;
-            const box = { x: p.x + 7 * u, y: p.y - h / 2, w, h };
-            if (placed.some((b) => box.x < b.x + b.w && box.x + box.w > b.x && box.y < b.y + b.h && box.y + box.h > b.y)) continue;
-            placed.push(box);
-            if (full) this._shownLabels.add(String(s.name).trim().toLowerCase());
-            svg += `<g pointer-events="none"><rect x="${box.x.toFixed(3)}" y="${box.y.toFixed(3)}" width="${w.toFixed(3)}" height="${h.toFixed(3)}" rx="${(7 * u).toFixed(3)}" fill="var(--card-background-color, #fff)" opacity="0.88"></rect>`
-                + svgText(box.x + 5 * u, p.y + 3.3 * u, 9, u, 'fill="var(--primary-text-color, #212121)"', esc(name)) + "</g>";
-        }
-        return svg;
     }
 
     _stopHover(e, on) {

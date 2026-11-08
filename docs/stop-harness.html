@@ -169,7 +169,7 @@ window.addEventListener("unhandledrejection", (e) => fatal(e.reason));
  * id from an earlier hour; one carries no trip id at all. */
 const SHIFT_MS = (120 - 0) * 1000;   // first departure 2 min out
 const iso = (offsetSec) => new Date(Date.now() + offsetSec * 1000).toISOString();
-const dep = (inSec, route, trip, headsign, delay = -86) => ({
+const dep = (inSec, route, trip, headsign, delay = -86, stopName = "Northbound Main St @ E 18 Ave") => ({
   departure: new Date(Date.now() + (inSec + delay) * 1000)
     .toTimeString().slice(0, 5),
   departure_datetime: iso(inSec),
@@ -179,7 +179,7 @@ const dep = (inSec, route, trip, headsign, delay = -86) => ({
   delay_realtime_derived: "-0:01:26",
   delay_realtime: delay,
   date: iso(0).slice(0, 10),
-  stop_name: "Northbound Main St @ E 18 Ave",
+  stop_name: stopName,
   stop_id: "171",
   route,
   route_long: route === "003" ? "Main" : "Fraser",
@@ -223,7 +223,7 @@ states[stop2Id] = {
     ...states[stopId].attributes,
     latitude: 49.254339,
     longitude: -123.100959,
-    next_departures_lines: [dep(600, "003", "15441299", "3 Main/To Waterfront Station", 0)],
+    next_departures_lines: [dep(600, "003", "15441299", "3 Main/To Waterfront Station", 0, "Northbound Main St @ E 17 Ave")],
     friendly_name: "GTFS - home-departures 170_local_stop_zone.home",
   },
 };
@@ -335,7 +335,8 @@ const base = {
   title: "Buses nearby",
   stops: [stopId, stop2Id],
   route_ids: { "003": "6613", "015": "6627" },
-  positions_url: "/local/gtfs2/6613_0.json",
+  // no positions_url override: the card derives one file per
+  // (route, direction) from route_ids, as it will in production
   refresh: moving ? 15 : 60,
 };
 
