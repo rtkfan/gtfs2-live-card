@@ -1467,7 +1467,7 @@ class Gtfs2StopCard extends HTMLElement {
     }
 
     static getConfigElement() {
-        return document.createElement("gtfs2-live-card-editor");
+        return document.createElement("gtfs2-stop-card-editor");
     }
 
     // Home Assistant hands over the entities picked before the card, in the
@@ -4639,6 +4639,12 @@ class Gtfs2StopCardEditor extends HTMLElement {
         return [resolveLang(hass), ...ids.sort()].join("|");
     }
 
+    // the language files arrive while the editor is open: the first render
+    // was held back for them, the later ones redraw labelled
+    _langArrived() {
+        this._render();
+    }
+
     // the sensors the picker offers: gtfs2's local stops alone - and those
     // the card already names, known or not, so a picked one never vanishes
     // from its own field
@@ -4720,7 +4726,9 @@ class Gtfs2StopCardEditor extends HTMLElement {
 
     _stopSchema() {
         return [
-            { name: "entity", selector: { text: {} } },
+            // an entity selector: Home Assistant renders its own picker from
+            // it (the test harness draws a plain field)
+            { name: "entity", selector: { entity: { multiple: false, filter: { domain: "sensor" } } } },
             { name: "label", selector: { text: {} } },
             { name: "positions_url", selector: { text: {} } },
         ];
@@ -4837,7 +4845,7 @@ class Gtfs2StopCardEditor extends HTMLElement {
         });
         const add = document.createElement("button");
         add.type = "button";
-        add.textContent = `+ ${L.t_add ?? "add"}`;
+        add.textContent = `+ ${L.s_add ?? "+"}`;
         add.style.marginTop = "10px";
         add.addEventListener("click", () => {
             this._stops.push({ entity: "" });

@@ -340,7 +340,22 @@ const base = {
   refresh: moving ? 15 : 60,
 };
 
-if (page === "board") {
+if (page === "editor") {
+  // the visual editor: getConfigElement hands back the registered editor
+  customElements.whenDefined("gtfs2-stop-card").then(async () => {
+    const el = document.createElement("gtfs2-stop-card");
+    el.setConfig({ ...base });
+    el.hass = hass;
+    const ed = await el.constructor.getConfigElement();
+    ed.hass = hass;
+    ed.setConfig({ ...base });
+    const cell = document.createElement("div");
+    cell.className = "cell";
+    cell.style.width = "470px";
+    cell.appendChild(ed);
+    stage.appendChild(cell);
+  });
+} else if (page === "board") {
   card({ ...base, show_map: false }, "board only", 470);
 } else if (page === "map") {
   card({ ...base, show_departures: false, map_aspect: "4/3" }, "map only", 470);
@@ -358,14 +373,14 @@ const settle = Number(q.get("settle") || 0) * 1000;
 const t0 = Date.now();
 let lastHeight = -1, stable = 0;
 const ready = () => {
-  const el = document.querySelector("gtfs2-stop-card");
-  const cardEl = el?.shadowRoot?.querySelector("ha-card");
+  const el = document.querySelector(page === "editor" ? "gtfs2-stop-card-editor" : "gtfs2-stop-card");
+  const cardEl = page === "editor" ? el : el?.shadowRoot?.querySelector("ha-card");
   return Date.now() - t0 >= settle && !document.getElementById("fatal").textContent
-    && cardEl && cardEl.getBoundingClientRect().height > 40;
+    && cardEl && (page === "editor" ? cardEl.childElementCount > 0 : cardEl.getBoundingClientRect().height > 40);
 };
 setInterval(() => {
-  const el = document.querySelector("gtfs2-stop-card");
-  const cardEl = el?.shadowRoot?.querySelector("ha-card");
+  const el = document.querySelector(page === "editor" ? "gtfs2-stop-card-editor" : "gtfs2-stop-card");
+  const cardEl = page === "editor" ? el : el?.shadowRoot?.querySelector("ha-card");
   const h = cardEl ? Math.ceil(cardEl.getBoundingClientRect().height + 20) : 0;
   if (ready() && h === lastHeight) stable += 1; else stable = 0;
   lastHeight = h;
