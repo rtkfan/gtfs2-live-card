@@ -49,6 +49,9 @@ route_ids:
   "003": "6613"
   "015": "6627"
 max_departures: 8
+# one departures section per stop (the default); "none" merges them into
+# a single time-sorted list
+group_by: stop
 # vehicles on the map: all running a board departure (default), or also
 # same-route vehicles near a stop
 # max_vehicles: nearby
@@ -63,6 +66,9 @@ fallback), `refresh` (s), `max_departures`, `max_vehicles` (`true` or
 
 `route_ids` needs one entry per route you care about; find the ids in the
 file names gtfs2 writes under `/config/www/gtfs2/`.
+
+Tapping a vehicle on the map tracks it and highlights its row on the board
+(the run the vehicle is running), for as long as it stays tracked.
 
 ## Development
 

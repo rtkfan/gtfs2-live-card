@@ -1,6 +1,6 @@
 // Based on gtfs2-live-card by Pulpyyyy (MIT), modified for gtfs2
 // local-stop sensors. See LICENSE.
-const CARD_VERSION = "0.1.0";
+const CARD_VERSION = "0.1.2";
 
 console.info(
     `%c 🚏 GTFS2 Stop Card %c v${CARD_VERSION} %c`,
@@ -51,6 +51,7 @@ const DEFAULTS = {
     longitude: null,
     refresh: 60,
     max_departures: 8,
+    group_by: "stop",         // one section per stop on the board; "none" merges them
     // Which vehicles the map shows: true, only those running a departure on
     // the board (joined by trip_id); "nearby", also same-route vehicles
     // within nearby_radius_km of a configured stop
@@ -1614,6 +1615,35 @@ class Gtfs2StopCard extends HTMLElement {
             this._persistCollapsed();
             this._renderMapSection();
             if (!this._collapsed.map) this._fetchAll(true);
+        } else if (action === "row") {
+            // a departure tapped on the board: track the bus running it and
+            // zoom the map on it, the same as tapping the bus itself. Tapped
+            // again, or its vehicle gone from the feed, it lets go
+            const li = Number(ds.li);
+            const slot = this._ld[li];
+            const f = (slot?.geo?.features || [])
+                .find((x) => x.properties?.trip_id != null && String(x.properties.trip_id) === String(ds.trip || ""));
+            if (this._focus && this._focus.li === li
+                && f && this._vid(f) === this._focus.vid) {
+                this._focus = null;
+                this._manual = false;
+                this._restoreTrackedLine();
+                this._renderHeader();
+                this._renderDepartures();
+                this._renderMap(false);
+                return;
+            }
+            if (!f) return;   // not running right now: nothing to zoom on
+            this._trackAt = performance.now();
+            this._focus = { li, vid: this._vid(f) };
+            this._manual = false;
+            if (this._hiLine !== li) {
+                if (this._trackPrev === undefined) this._trackPrev = this._hiLine;
+                this._hiLine = li;
+                this._renderHeader();
+            }
+            this._renderDepartures();
+            this._renderMap(true);
         } else if (action === "bus") {
             const li = Number(ds.li);
             this._trackAt = performance.now();
@@ -2180,7 +2210,7 @@ class Gtfs2StopCard extends HTMLElement {
         // ending its service must not relabel the whole card as schedule-only
         const lang = this._lang();
         const srcs = this._depSources();
-        const rtTimes = srcs.map((s) => parseTs(s.st.attributes?.gtfs_rt_updated_at)).filter(Boolean).map((d) => d.getTime());
+        const rtTimes = srcs.map((s) => parseTs(s.st.attributes?.gtfs_updated_at ?? s.st.attributes?.gtfs_rt_updated_at)).filter(Boolean).map((d) => d.getTime());
         const newest = rtTimes.length ? Math.max(...rtTimes) : 0;
         const unavailable = srcs.filter((s) => s.st.state === "unavailable").length;
         let left = srcs.length
@@ -2196,10 +2226,11 @@ class Gtfs2StopCard extends HTMLElement {
 
     /* ── PANE 1: DEPARTURES ─────────────────────────────────────────────── */
 
-    _departureRows() {
-        const sources = this._depSources();
+    // All rows the card's stops list, filtered and sorted, uncapped: the
+    // board, the grouping and the vehicle join all read from this
+    _allRows() {
         let rows = [];
-        for (const src of sources) rows.push(...this._sourceRows(src));
+        for (const src of this._depSources()) rows.push(...this._sourceRows(src));
         // a route picked by tapping its badge filters the board to that
         // route, across every stop the card holds
         if (this._hiLine != null) {
@@ -2213,7 +2244,21 @@ class Gtfs2StopCard extends HTMLElement {
         const now = Date.now(), cutoff = now - DEPART_GRACE_MS;
         const upcoming = rows.filter((r) => Math.max(r.time.getTime(), r.theo ? r.theo.getTime() : 0) > cutoff);
         upcoming.sort((x, y) => x.time.getTime() - y.time.getTime());
-        return { rows: upcoming.slice(0, this._config.max_departures), multi: sources.length > 1 };
+        return upcoming;
+    }
+
+    _departureRows() {
+        const upcoming = this._allRows();
+        return { rows: upcoming.slice(0, this._config.max_departures), multi: this._depSources().length > 1 };
+    }
+
+    // The trip of the vehicle tracked on the map, when it has one: its row
+    // on the board is highlighted while it is tracked
+    _focusTrip() {
+        if (!this._focus) return null;
+        const slot = this._ld[this._focus.li];
+        const f = slot?.geo?.features?.find((x) => this._vid(x) === this._focus.vid);
+        return f?.properties?.trip_id != null ? String(f.properties.trip_id) : null;
     }
 
     // A departure ridden by another mode than its line's, a replacement
@@ -2363,6 +2408,9 @@ class Gtfs2StopCard extends HTMLElement {
             + ` role="button" tabindex="0" title="${clear}" aria-label="${clear}">${esc(this._lineLabelOf(hiDef))}<span class="x" aria-hidden="true">×</span></span>`
             : "";
         const { rows, multi } = this._departureRows();
+        // the run of the vehicle tracked on the map lights up on the board
+        const focusTrip = this._focusTrip();
+        if (focusTrip) for (const r of rows) r.hit = r.tripId === focusTrip;
         // the line of each row: needed among several sensors, and on one
         // sensor whose runs ride different lines (a train sensor on K8+, K6+
         // and P8). The destinations stay a matter of several sensors
@@ -2406,7 +2454,26 @@ class Gtfs2StopCard extends HTMLElement {
             <span class="spacer"></span>
             ${hasRt ? `<span class="live-dot"></span><span class="summary">${this._t("realtime")}</span>` : `<span class="summary">${this._t("scheduled")}</span>`}`;
 
-        const rowsHtml = this._isTable()
+        // the board: one section per stop when the card holds several and
+        // the config asks for it (the default) - two stops on the same
+        // route, one each way, read far better apart - else one merged list
+        const group = this._config.group_by !== "none" && this._lineDefs().length > 1;
+        const rowsHtml = group
+            ? this._lineDefs().map((d) => {
+                const rs = this._allRows().filter((r) => r.def?.idx === d.idx)
+                    .slice(0, this._config.max_departures);
+                if (focusTrip) for (const r of rs) r.hit = r.tripId === focusTrip;
+                if (!rs.length) return "";
+                // the headsign in the heading only when the stop's upcoming
+                // departures all go the same way; a stop serving several
+                // routes or directions lets its rows say where each goes
+                const heads = [...new Set(rs.map((r) => r.headsign).filter(Boolean))];
+                return `<div class="jsec">${esc(d.label || this._lineLabelOf(d))}`
+                    + (heads.length === 1 ? `<span class="jsec-sub">→ ${esc(heads[0])}</span>` : "")
+                    + `</div>`
+                    + this._departuresTableHtml(rs, false, rs.find((r) => !r.struck), lang, now);
+            }).join("")
+            : this._isTable()
             ? this._departuresTableHtml(rows, multi, nextRow, lang, now)
             : rows.map((r) => {
             const strike = r.rt && r.theo && Math.abs(r.time - r.theo) >= 60000;
@@ -2428,7 +2495,7 @@ class Gtfs2StopCard extends HTMLElement {
             // a struck run: its time struck through, no countdown to a bus
             // that does not come, the chip saying which of the two it is
             return `
-            <div class="row${r.struck ? " struck" : ""}">
+            <div class="row${r.struck ? " struck" : ""}${r.hit ? " hit" : ""}"${r.tripId ? ` data-action="row" data-li="${r.def?.idx ?? 0}" data-trip="${esc(r.tripId)}" role="button" tabindex="0"` : ""}>
                 ${badge}
                 <div class="times">
                     <div class="time-line">
@@ -2550,7 +2617,7 @@ class Gtfs2StopCard extends HTMLElement {
         const lined = multi || rows.some((r) => r.line);
         // a via column only when a line of the board has stops on the way
         const showVia = rows.some((r) => (vias.get(r.def?.idx) || []).length);
-        const ncol = 3 + (lined ? 1 : 0) + (showVia ? 1 : 0);
+        const ncol = 4 + (lined ? 1 : 0) + (showVia ? 1 : 0);
         // a run leaving past the origin, or ending short of the destination,
         // names the place beside its time: the times then start the cells,
         // read from the left, whatever follows them
@@ -2572,8 +2639,15 @@ class Gtfs2StopCard extends HTMLElement {
             // a coach on a train line says so on the same left side, for the
             // same reason, and so does the operator's alert on the run
             const e = ends.get(r);
+            const moved = r.rt && r.theo && Math.abs(r.time - r.theo) >= 60000;
+            // the schedule slot under the realtime time it moved from: quiet,
+            // in parentheses, aligned with the digits - the feed's answer is
+            // the loud one, the timetable the reference it moved away from
             const dep = (r.rt ? `<span class="rt-icon">${ICONS.live}</span>` : "") + this._rowModeHtml(r) + this._rowAlertHtml(r)
-                + (r.struck ? `<span class="struck">${this._hm(r.time, r.def?.zone)}</span>` : this._hm(r.time, r.def?.zone))
+                + `<span class="dep-stack">${r.struck
+                    ? `<span class="struck">${this._hm(r.time, r.def?.zone)}</span>`
+                    : this._hm(r.time, r.def?.zone)
+                        + (moved ? `<span class="sched-at">(${esc(this._hm(r.theo, r.def?.zone))})</span>` : "")}</span>`
                 + (e.on ? ` <span class="end-at">${esc(e.on)}</span>` : "");
             const depTitle = r.struck ? this._t(r.struck === "cancelled" ? "cancelled" : "not_stopping")
                 : r.rt && r.theo && Math.abs(r.time - r.theo) >= 60000
@@ -2594,7 +2668,14 @@ class Gtfs2StopCard extends HTMLElement {
                 rv.length ? `<span class="sub-via">${this._t("col_via")} ${this._viasHtml(rv)}</span>` : ""].filter(Boolean);
             const sub = words.length ? `<tr class="row-sub">${lined ? "<td></td>" : ""}<td colspan="${ncol - (lined ? 1 : 0)}">${words.join("")}</td></tr>` : "";
             const num = named ? "num at" : "num";
-            return sep + `<tr>${line}<td class="${num} dep fit" title="${esc(depTitle)}">${dep}</td><td class="dly-c fit">${dly}</td>${via}${last}</tr>` + sub;
+            // a row is a button: tapping it tracks the bus running the run
+            // and zooms the map on it (see _act, action "row")
+            const rowAttrs = r.tripId
+                ? ` data-action="row" data-li="${r.def?.idx ?? 0}" data-trip="${esc(r.tripId)}" role="button" tabindex="0"`
+                : "";
+            const inCell = r.struck ? `<td class="fit"></td>`
+                : `<td class="fit"><span class="countdown" data-ts="${r.time.getTime()}">${fmtCountdown(lang, r.time, now)}</span></td>`;
+            return sep + `<tr${r.hit ? ` class="hit"` : ""}${rowAttrs}>${line}${inCell}<td class="${num} dep fit" title="${esc(depTitle)}">${dep}</td><td class="dly-c fit">${dly}</td>${via}${last}</tr>` + sub;
         }).join("");
         const summary = nextRow ? `<div class="board-next">${this._t("next_dep_in", {
             c: `<span class="countdown" data-ts="${nextRow.time.getTime()}">${fmtCountdown(lang, nextRow.time, now)}</span>`,
@@ -2603,6 +2684,7 @@ class Gtfs2StopCard extends HTMLElement {
         return summary
             + `<div class="board-wrap"><table class="board"><thead><tr>`
             + (lined ? `<th class="fit">${this._t("col_line")}</th>` : "")
+            + `<th class="fit">${this._t("col_in")}</th>`
             + `<th class="${named ? "num at" : "num"} fit">${this._t("col_departure")}</th><th class="fit"></th>`
             + (showVia ? `<th class="fit vias">${this._t("col_via")}</th>` : "") + `<th${showDest ? ` class="dest-c"` : ""}>${showDest ? this._t("col_destination") : ""}</th>`
             + `</tr></thead><tbody>${cells}</tbody></table></div>`;
@@ -4369,6 +4451,15 @@ class Gtfs2StopCard extends HTMLElement {
         .jsec { padding: 10px 16px 2px; font-size: 12px; font-weight: 600; letter-spacing: .02em; color: var(--secondary-text-color); border-top: 1px solid var(--divider-color); }
         .jsec:first-child { border-top: none; }
         .jsec + .row { border-top: none; }
+        .jsec-sub { font-weight: 500; margin-left: 8px; color: var(--primary-text-color); opacity: .75; }
+        /* the run of the vehicle tracked on the map, lit on the board */
+        .board tr.hit > td { background: color-mix(in srgb, var(--primary-color) 10%, transparent); }
+        .board tr.hit > td:first-child { box-shadow: inset 3px 0 0 var(--primary-color); }
+        .row.hit { background: color-mix(in srgb, var(--primary-color) 10%, transparent); box-shadow: inset 3px 0 0 var(--primary-color); }
+        /* a row is a button: tapping it tracks its bus on the map */
+        .board tr[data-action="row"], .row[data-action="row"] { cursor: pointer; }
+        .board tr[data-action="row"]:hover > td { background: color-mix(in srgb, var(--primary-color) 6%, transparent); }
+        .board tr[data-action="row"]:focus-visible { outline: 2px solid var(--primary-color); outline-offset: -2px; }
         .jbadges { display: inline-flex; gap: 3px; }
         /* which journey a row is, under its head: badge and title */
         .jwhere { display: flex; align-items: center; gap: 6px; min-width: 0; margin-top: -3px; font-size: 12px; color: var(--secondary-text-color); }
@@ -4476,6 +4567,9 @@ class Gtfs2StopCard extends HTMLElement {
         /* the delay follows the time it moves */
         .board .dly { font-size: 11px; font-weight: 600; }
         .board .dly-c { padding-left: 0; }
+        /* the schedule slot under the realtime time it moved from */
+        .dep-stack { display: inline-flex; flex-direction: column; align-items: flex-start; line-height: 1.2; vertical-align: middle; }
+        .dep-stack .sched-at { font-size: 11px; font-style: italic; font-weight: 400; color: var(--secondary-text-color); }
         .board .dest { display: inline-block; max-width: 12em; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; }
         .board td.dep { font-weight: 700; }
         .board td .rt-icon { margin-right: 4px; }
@@ -4666,6 +4760,8 @@ class Gtfs2StopCardEditor extends HTMLElement {
             { name: "show_departures", selector: { boolean: {} } },
             ...(c.show_departures === false ? [] : [
                 { name: "max_departures", selector: { number: { min: 1, max: 20, mode: "box" } } },
+                { name: "group_by", selector: { select: { mode: "dropdown", options: [
+                    { value: "stop", label: "stop" }, { value: "none", label: "none" }] } } },
             ]),
         ];
         return [
@@ -4692,6 +4788,7 @@ class Gtfs2StopCardEditor extends HTMLElement {
         if (id === "dep") return {
             show_departures: c.show_departures !== false,
             max_departures: c.max_departures ?? DEFAULTS.max_departures,
+            group_by: c.group_by ?? DEFAULTS.group_by,
         };
         return {
             show_map: c.show_map !== false,
@@ -4879,6 +4976,7 @@ class Gtfs2StopCardEditor extends HTMLElement {
             else c[key] = val;
         };
         assign("max_departures", false);
+        assign("group_by", true);
         assign("refresh", false);
         assign("map_style", true);
         assign("map_aspect", false);

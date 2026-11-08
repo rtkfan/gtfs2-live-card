@@ -40,6 +40,7 @@ export default {
         to: "para {d}",
         next_dep_in: "Próxima partida {c}",
         col_departure: "Partida",
+        col_in: "Em",
         col_arrival: "Chegada",
         col_via: "Via",
         col_duration: "Duração",

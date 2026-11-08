@@ -41,6 +41,7 @@ export default {
         to: "to {d}",
         next_dep_in: "Next departure {c}",
         col_departure: "Departure",
+        col_in: "In",
         col_arrival: "Arrival",
         col_via: "Via",
         col_duration: "Duration",

@@ -40,6 +40,7 @@ export default {
         to: "vers {d}",
         next_dep_in: "Prochain départ {c}",
         col_departure: "Départ",
+        col_in: "Dans",
         col_arrival: "Arrivée",
         col_via: "Via",
         col_duration: "Durée",
