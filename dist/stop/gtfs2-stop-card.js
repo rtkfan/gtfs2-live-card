@@ -1,6 +1,6 @@
 // Based on gtfs2-live-card by Pulpyyyy (MIT), modified for gtfs2
 // local-stop sensors. See LICENSE.
-const CARD_VERSION = "0.1.7";
+const CARD_VERSION = "0.1.16";
 
 console.info(
     `%c 🚏 GTFS2 Stop Card %c v${CARD_VERSION} %c`,
@@ -2956,6 +2956,7 @@ class Gtfs2StopCard extends HTMLElement {
             // route_ids mapping the geojson files are named by)
             const vehs = await this._fetchFeedAll(force).catch(() => null);
             if (vehs) {
+                ok = true;   // the feed itself read: an empty match below is not an error
                 const map = this._config.route_ids && typeof this._config.route_ids === "object" ? this._config.route_ids : {};
                 const want = new Set(Object.values(map).map(String));
                 const routes = new Set();
@@ -2994,6 +2995,9 @@ class Gtfs2StopCard extends HTMLElement {
                     if (Number.isFinite(g)) lm = Math.min(lm, g);
                 }
             }
+            // a read that succeeded but matched no route (the card's
+            // route_ids may name fewer routes than the stop serves) is an
+            // empty board, not an error: the slot stays a FeatureCollection
             slot.geo = ok ? { type: "FeatureCollection", features: feats } : null;
             slot.geoAt = Date.now();
             slot.err = ok ? null : "empty";
@@ -3013,7 +3017,7 @@ class Gtfs2StopCard extends HTMLElement {
             } else if (sig !== slot.sig) { slot.sig = sig; slot.sigAt = now; }
             // entity-less cards derive badge labels from the feed: refresh them
             if (!this._depSources().length) this._renderHeader();
-            for (const f of slot.geo.features || []) {
+            for (const f of slot.geo?.features || []) {
                 const key = `${def.idx}:${this._vid(f)}`;
                 const [lon, lat] = f.geometry?.coordinates || [];
                 if (lat == null || lon == null) continue;
@@ -3548,6 +3552,37 @@ class Gtfs2StopCard extends HTMLElement {
         // the tracking - so the vehicle is in one place for all of them
         for (const e of all) this._placeVeh(e);
 
+        // each vehicle's colour: the one its route's badge wears, not the
+        // stop's first-route colour - a stop serving two lines would
+        // otherwise paint both in one. The board's own join is the first
+        // authority (trip_id → the departure's route code, no mapping
+        // needed); the reverse of route_ids answers for vehicles nothing
+        // on the board rides (the nearby fallback)
+        const byTrip = new Map();
+        for (const r of this._departureRows().rows) {
+            if (r.tripId != null && r.line != null && !byTrip.has(String(r.tripId))) {
+                byTrip.set(String(r.tripId), r.line);
+            }
+        }
+        const revColor = new Map();
+        const cmap = this._config.route_ids && typeof this._config.route_ids === "object" ? this._config.route_ids : {};
+        for (const [code, rid] of Object.entries(cmap)) revColor.set(String(rid), code);
+        const vehColor = (e) => {
+            const tid = e.f.properties?.trip_id != null ? String(e.f.properties.trip_id) : null;
+            const code = (tid != null && byTrip.get(tid)) || revColor.get(String(e.f.properties?.route_id ?? "")) || null;
+            // a vehicle can be attached to a def whose own departures don't
+            // list its route (the first stop in card order claims it from the
+            // shared feed): resolve the code against every stop's colours,
+            // not just the one it landed on. _lineColorOf cannot answer the
+            // question (it falls back to the def's own colour, never null),
+            // so read the codeColors maps directly
+            let col = code && e.def.codeColors?.get(code);
+            for (let i = 0; !col && i < defs.length; i++) col = code && defs[i].codeColors?.get(code);
+            return col || e.def.color || "#0072bc";
+        };
+        // the popup reads it too, through _renderMap's closure on _mapPaint
+        this._vehColorOf = vehColor;
+
         // the tracked vehicle: on its own def first, else anywhere - two
         // stops sharing a route read one feed, and the map draws the vehicle
         // once, for the first stop that lists it
@@ -3734,7 +3769,7 @@ class Gtfs2StopCard extends HTMLElement {
             return out.filter((r) => r.length > 1);
         };
         for (const e of all) {
-            const color = e.def.color || "#0072bc";
+            const color = vehColor(e);
             const active = focusEntry ? focusEntry === e : (topLi == null || e.def.idx === topLi);
             // the scheduled path of this trip, when its route's static file
             // has landed: solid behind, dotted ahead
@@ -3852,7 +3887,8 @@ class Gtfs2StopCard extends HTMLElement {
             // view where a dozen markers would otherwise clot together. The
             // tracked vehicle keeps the full size, it is the one being read.
             const R = (focused ? 16 : markerR) * u;
-            const ink = inkOn(def.color);
+            const vcol = vehColor(e);
+            const ink = inkOn(vcol);
             const body = (this._config.mode_icons !== false
                     // r is now the ink radius, not half the longest side: 0.638
                     // is the factor that leaves the marker glyphs the average
@@ -3863,14 +3899,14 @@ class Gtfs2StopCard extends HTMLElement {
             // heading arrow: only when a heading is known, and only on the
             // markers big enough to carry it without turning into a blob
             const beak = angle != null && (focused || !dim)
-                ? `<g class="hd"><path d="M0 ${(-R - 10 * u).toFixed(3)} L${(6.6 * u).toFixed(3)} ${(-R + 1.4 * u).toFixed(3)} L${(-6.6 * u).toFixed(3)} ${(-R + 1.4 * u).toFixed(3)} Z" fill="${esc(def.color)}" stroke="var(--card-background-color, #fff)" stroke-width="${(1.6 * u).toFixed(3)}" stroke-linejoin="round"></path></g>`
+                ? `<g class="hd"><path d="M0 ${(-R - 10 * u).toFixed(3)} L${(6.6 * u).toFixed(3)} ${(-R + 1.4 * u).toFixed(3)} L${(-6.6 * u).toFixed(3)} ${(-R + 1.4 * u).toFixed(3)} Z" fill="${esc(vcol)}" stroke="var(--card-background-color, #fff)" stroke-width="${(1.6 * u).toFixed(3)}" stroke-linejoin="round"></path></g>`
                 : "";
             const inner = `
                 <circle r="${Math.max(22, R / u + 9) * u}" fill="transparent" stroke="none"></circle>
-                ${focused ? `<circle r="${23 * u}" fill="${esc(def.color)}" opacity="0.15"></circle>` : ""}
+                ${focused ? `<circle r="${23 * u}" fill="${esc(vcol)}" opacity="0.15"></circle>` : ""}
                 ${beak}
                 <g>
-                    <circle r="${R}" fill="${esc(def.color)}" stroke="var(--card-background-color, #fff)" stroke-width="${2.5 * u}"></circle>
+                    <circle r="${R}" fill="${esc(vcol)}" stroke="var(--card-background-color, #fff)" stroke-width="${2.5 * u}"></circle>
                     ${body}
                 </g>
                 ${showLabel ? `<rect x="${-20 * u}" y="${18 * u}" width="${40 * u}" height="${16 * u}" rx="${8 * u}" fill="var(--card-background-color, #fff)" opacity="0.95"></rect>
@@ -4085,7 +4121,9 @@ class Gtfs2StopCard extends HTMLElement {
             : null;
         const terminus = row?.headsign || "";
         const badgeLabel = row?.line ?? this._lineLabelOf(entry.def);
-        const badgeColor = this._rowColor(row || { def: entry.def }, entry.def) || entry.def.color || "#777";
+        // the row's own def first (its codeColors holds the route the row
+        // is a departure of), then the vehicle's own resolved colour
+        const badgeColor = (row && this._rowColor(row)) || this._vehColorOf?.(entry) || entry.def.color || "#777";
         const showNext = nextStopName && nextStopName !== terminus;
         // speed only once measured (two positions seen): no placeholder
         const tele = [speed != null ? `${speed} km/h` : null, upd ? esc(upd) : null].filter(Boolean).join(" · ");
