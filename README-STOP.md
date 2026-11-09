@@ -43,11 +43,16 @@ stops:
   - entity: sensor.xxx_local_stop_zone.work  # …or an object
     label: Work stop
     # positions_url: /local/gtfs2/6613_0.json   # optional override
-# departure route code -> gtfs2's internal route id, which the positions
-# files under /config/www/gtfs2/ are named by ({route_id}_{direction}.json)
+# departure route code -> gtfs2's internal route id (the raw feed and the
+# positions files under /config/www/gtfs2/ both use the internal id)
 route_ids:
   "003": "6613"
   "015": "6627"
+# the agency-wide GTFS-RT vehicle feed gtfs2 saves locally (protobuf):
+# one source for every route and direction, decoded in the card - no
+# per-route files or extra flows needed. Without it the card falls back
+# to the per-route geojson files.
+positions_feed: /local/gtfs2/translink-pos.rt
 max_departures: 8
 # one departures section per stop (the default); "none" merges them into
 # a single time-sorted list

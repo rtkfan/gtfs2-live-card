@@ -190,12 +190,28 @@ const dep = (inSec, route, trip, headsign, delay = -86, stopName = "Northbound M
 });
 
 const deps = [
-  dep(120, "003", "15441234", "3 Main/To Waterfront Station"),
-  dep(720, "003", "15441235", "3 Main/To Waterfront Station", 240),
-  dep(1500, "003", "15441236", "3 Main/To Waterfront Station", 0),
-  dep(420, "015", "15452001", "15 Fraser/To Marine Drive Station", 90),
-  dep(2100, "015", "15452002", "15 Fraser/To Marine Drive Station", 0),
+  dep(120, "003", "FEEDTRIP-1", "3 Main/To Waterfront Station"),
+  dep(720, "003", "FEEDTRIP-2", "3 Main/To Waterfront Station", 240),
+  dep(1500, "003", "FEEDTRIP-3", "3 Main/To Waterfront Station", 0),
+  dep(420, "015", "FEEDTRIP-4", "15 Fraser/To Marine Drive Station", 90),
+  dep(2100, "015", "FEEDTRIP-5", "15 Fraser/To Marine Drive Station", 0),
 ];
+// the board's trip ids must be trips the feed actually carries, or the
+// trip_id join has nothing to match: rewrite them from the real feed's
+// 6613/6627 trips once it is loaded (deps above hold placeholders)
+const rewriteFeedTrips = (vehs) => {
+  const pools = {
+    "003": vehs.filter((v) => v.trip?.route_id === "6613").map((v) => v.trip.trip_id),
+    "015": vehs.filter((v) => v.trip?.route_id === "6627").map((v) => v.trip.trip_id),
+  };
+  window.__rw = { n: vehs.length, p003: pools["003"].length, p015: pools["015"].length };
+  let i = 0;
+  for (const d of deps) {
+    const pool = pools[d.route];
+    d.trip_id = pool.length ? pool[i++ % pool.length] : d.trip_id;
+  }
+  states[stop2Id] && (states[stop2Id].attributes.next_departures_lines[0].trip_id = pools["003"][i++ % (pools["003"].length || 1)] || "FEEDTRIP-6");
+};
 
 const states = {};
 const stopId = "sensor.gtfs2_home_departures_local_stop_zone_home";
@@ -223,7 +239,7 @@ states[stop2Id] = {
     ...states[stopId].attributes,
     latitude: 49.254339,
     longitude: -123.100959,
-    next_departures_lines: [dep(600, "003", "15441299", "3 Main/To Waterfront Station", 0, "Northbound Main St @ E 17 Ave")],
+    next_departures_lines: [dep(600, "003", "FEEDTRIP-6", "3 Main/To Waterfront Station", 0, "Northbound Main St @ E 17 Ave")],
     friendly_name: "GTFS - home-departures 170_local_stop_zone.home",
   },
 };
@@ -263,11 +279,28 @@ const pos = {
 };
 
 const realFetch = window.fetch;
+// the saved raw feed, for the ?feed=1 path (default): the real protobuf
+// gtfs2 wrote, served as-is
+const rtb = new Uint8Array(await (await fetch("data/translink-pos.rt")).arrayBuffer());
+// the board's trip ids must be trips the feed actually carries, or the
+// trip_id join has nothing to match: rewrite the placeholders from the
+// real feed's 6613/6627 trips
+const { decodeVehiclePositions } = await import("./rt-decode-probe.js");
+rewriteFeedTrips(decodeVehiclePositions(rtb));
 const json = (body) => Promise.resolve(new Response(JSON.stringify(body), {
   status: 200, headers: { "Content-Type": "application/json" } }));
 window.fetch = (input, init) => {
   const url = String(input?.url || input);
   if (/6613_[01]\.json|6627_[01]\.json/.test(url)) return json(pos);
+  // the static per-route trip paths, extracted from the real GTFS zip
+  const sm = url.match(/gtfs2-static\/(\d+)_shapes\.json/);
+  if (sm) return realFetch(`data/${sm[1]}_shapes.json`);
+  // the raw feed, served as the binary blob it is
+  if (/translink-pos\.rt/.test(url)) {
+    return Promise.resolve(new Response(rtb, {
+      status: 200, headers: { "Content-Type": "application/octet-stream",
+        "Last-Modified": new Date(Date.now() - 30000).toUTCString() } }));
+  }
   return realFetch(input, init);
 };
 
@@ -335,12 +368,36 @@ const base = {
   title: "Buses nearby",
   stops: [stopId, stop2Id],
   route_ids: { "003": "6613", "015": "6627" },
-  // no positions_url override: the card derives one file per
-  // (route, direction) from route_ids, as it will in production
+  // ?feed=0 keeps the per-route geojson path; the default exercises the
+  // raw protobuf feed, as the card will read it in production
+  positions_feed: q.get("feed") === "0" ? null : "/local/gtfs2/translink-pos.rt",
   refresh: moving ? 15 : 60,
 };
 
-if (page === "editor") {
+if (page === "rtprobe") {
+  // Option C probe: decode the saved raw feed with the hand-rolled decoder
+  // and report counts + route/trip coverage, no card involved
+  import("./rt-decode-probe.js").then(async ({ decodeVehiclePositions }) => {
+    const buf = await fetch("data/translink-pos.rt").then((r) => r.arrayBuffer());
+    const t0 = performance.now();
+    const vehs = decodeVehiclePositions(new Uint8Array(buf));
+    const ms = (performance.now() - t0).toFixed(1);
+    const withPos = vehs.filter((v) => v.pos && Number.isFinite(v.pos.latitude));
+    const trips = new Set(withPos.map((v) => v.trip?.trip_id).filter(Boolean));
+    const byRoute = {};
+    for (const v of withPos) {
+      const r = v.trip?.route_id, d = v.trip?.direction_id;
+      if (r == null) continue;
+      const k = `${r}|${d}`;
+      (byRoute[k] = byRoute[k] || new Set()).add(v.trip.trip_id);
+    }
+    const focus = Object.fromEntries(["6613", "6641", "6627"].map((r) =>
+      [r, { dir0: (byRoute[`${r}|0`] || { size: 0 }).size, dir1: (byRoute[`${r}|1`] || { size: 0 }).size }]));
+    window.__rtprobe = JSON.stringify({ ms, vehicles: vehs.length, withPos: withPos.length, trips: trips.size, focus });
+    document.getElementById("stage").innerHTML = `<div class="cell"><div class="caption">${window.__rtprobe}</div></div>`;
+    document.title = "ready 900x" + (withPos.length * 2 + 100) + " — rtprobe";
+  }).catch((e) => { document.getElementById("fatal").textContent += "\n" + (e?.stack || e); });
+} else if (page === "editor") {
   // the visual editor: getConfigElement hands back the registered editor
   customElements.whenDefined("gtfs2-stop-card").then(async () => {
     const el = document.createElement("gtfs2-stop-card");

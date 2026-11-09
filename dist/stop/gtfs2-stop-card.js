@@ -1,6 +1,6 @@
 // Based on gtfs2-live-card by Pulpyyyy (MIT), modified for gtfs2
 // local-stop sensors. See LICENSE.
-const CARD_VERSION = "0.1.2";
+const CARD_VERSION = "0.1.7";
 
 console.info(
     `%c 🚏 GTFS2 Stop Card %c v${CARD_VERSION} %c`,
@@ -37,6 +37,11 @@ const DEFAULTS = {
     title: null,
     stop_color: "#0072bc",
     positions_url: null,      // optional global override; per stop wins
+    // the agency-wide GTFS-RT vehicle-positions feed gtfs2 saves locally
+    // (protobuf). When set, it is the one source of vehicles: complete
+    // for every route and direction, no per-route files needed. The
+    // per-route geojson stays as the fallback when it is not set.
+    positions_feed: null,
     stops: null,              // list of local-stop sensor entity_ids and/or {entity?, positions_url?, label?}
     route_ids: null,          // {routeCode: gtfs2RouteId} - the positions files are named by the latter
     mode_icons: true,         // mode chip (mdi) on the route badges
@@ -109,6 +114,13 @@ const HIST_MAX = 30;
 // a departure rides the board this long past its time, then leaves - and
 // its vehicle with it
 const DEPART_GRACE_MS = 2 * 60000;
+// the scheduled paths drawn around the card's stops: a trip's path only
+// shows within this distance of a stop, so a run that started across town
+// does not drag its whole morning across the map
+const PATH_RADIUS_M = 2000;
+// the fitted view reaches this far past the stops; a vehicle farther out
+// is still drawn, off screen until the user pans there
+const FIT_RADIUS_M = 3000;
 const HIST_TTL = 15 * 60000;  // forget vehicles gone from the feed this long
 const STALE_FEED = 8 * 60000;  // a positions file not rewritten this long = the source has gone quiet
 // realtime a sensor has not refreshed this long is no longer live: three of
@@ -726,6 +738,161 @@ function fetchJsonShared(url, maxAgeMs) {
     return promise;
 }
 
+// ── GTFS-RT vehicle positions, decoded off the wire ────────────────────
+// A minimal decoder for the one message the card reads, no library. Field
+// numbers are the official gtfs-realtime proto's: FeedMessage 1 header /
+// repeated 2 entity; FeedEntity 1 id / 4 vehicle; VehiclePosition 1 trip /
+// 2 position / 3 current_stop_sequence / 8 vehicle; TripDescriptor 1
+// trip_id / 5 route_id / 6 direction_id; Position 1 lat / 2 lon / 3
+// bearing; VehicleDescriptor 1 id / 2 label. Unknown fields are skipped by
+// their length (or their group end), so a feed carrying more than this
+// decodes all the same.
+const RT = (() => {
+    // one reader over the current buffer; decodeVehiclePositions is not
+    // reentrant anyway, and this keeps every helper one argument lighter
+    let buf = null, dv = null, p = 0;
+    const varint = () => {
+        let shift = 0, val = 0n;
+        for (;;) {
+            const b = buf[p++];
+            val |= BigInt(b & 0x7f) << BigInt(shift);
+            if (!(b & 0x80)) return val;
+            shift += 7;
+        }
+    };
+    const text = (n) => new TextDecoder().decode(buf.subarray(p, p + n));
+    const f32 = (at) => dv.getFloat32(at, true);
+    const skip = (wt) => {
+        if (wt === 0) varint();
+        else if (wt === 1) p += 8;
+        else if (wt === 2) { const n = Number(varint()); p += n; }
+        else if (wt === 5) p += 4;
+        else if (wt === 3) {  // deprecated start-group: run to its end-group
+            for (;;) {
+                const t = varint();
+                if (Number(t & 7n) === 4) break;
+                skip(Number(t & 7n));
+            }
+        }
+        else throw new Error("gtfs2-stop-card: protobuf wire type " + wt);
+    };
+    const lenField = () => { const n = Number(varint()); const e = p + n; return e; };
+    function trip() {
+        const o = {};
+        const e = lenField();
+        while (p < e) {
+            const t = varint(); const wt = Number(t & 7n), fn = Number(t >> 3n);
+            if (fn === 1 && wt === 2) { const n = Number(varint()); o.trip_id = text(n); p += n; }
+            else if (fn === 5 && wt === 2) { const n = Number(varint()); o.route_id = text(n); p += n; }
+            else if (fn === 6 && wt === 0) o.direction_id = Number(varint());
+            else skip(wt);
+        }
+        p = e;
+        return o;
+    }
+    function position() {
+        const o = {};
+        const e = lenField();
+        while (p < e) {
+            const t = varint(); const wt = Number(t & 7n), fn = Number(t >> 3n);
+            if (fn === 1 && wt === 5) { o.latitude = f32(p); p += 4; }
+            else if (fn === 2 && wt === 5) { o.longitude = f32(p); p += 4; }
+            else if (fn === 3 && wt === 5) { o.bearing = f32(p); p += 4; }
+            else skip(wt);
+        }
+        p = e;
+        return o;
+    }
+    function vehDesc() {
+        const o = {};
+        const e = lenField();
+        while (p < e) {
+            const t = varint(); const wt = Number(t & 7n), fn = Number(t >> 3n);
+            if (fn === 1 && wt === 2) { const n = Number(varint()); o.id = text(n); p += n; }
+            else if (fn === 2 && wt === 2) { const n = Number(varint()); o.label = text(n); p += n; }
+            else skip(wt);
+        }
+        p = e;
+        return o;
+    }
+    function vehicle() {
+        const o = { trip: null, pos: null, seq: null, vehicle: null };
+        const e = lenField();
+        while (p < e) {
+            const t = varint(); const wt = Number(t & 7n), fn = Number(t >> 3n);
+            if (fn === 1 && wt === 2) { o.trip = trip(); }
+            else if (fn === 2 && wt === 2) { o.pos = position(); }
+            else if (fn === 3 && wt === 0) o.seq = Number(varint());
+            else if (fn === 8 && wt === 2) { o.vehicle = vehDesc(); }
+            else skip(wt);
+        }
+        p = e;
+        return o;
+    }
+    return {
+        decode(u8) {
+            buf = u8;
+            dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+            p = 0;
+            const out = [];
+            const end = u8.length;
+            while (p < end) {
+                const t = varint(); const wt = Number(t & 7n), fn = Number(t >> 3n);
+                if (fn !== 2 || wt !== 2) { skip(wt); continue; }   // header, unknowns
+                const e = lenField();
+                let veh = null, id = null;
+                while (p < e) {
+                    const t2 = varint(); const w2 = Number(t2 & 7n), f2 = Number(t2 >> 3n);
+                    if (f2 === 1 && w2 === 2) { const n = Number(varint()); id = text(n); p += n; }
+                    else if (f2 === 4 && w2 === 2) { veh = vehicle(); }
+                    else skip(w2);
+                }
+                p = e;
+                if (veh && veh.pos && Number.isFinite(veh.pos.latitude)) {
+                    out.push({
+                        id: veh.vehicle?.id || id || "bus",
+                        label: veh.vehicle?.label || null,
+                        tripId: veh.trip?.trip_id || null,
+                        routeId: veh.trip?.route_id || null,
+                        directionId: veh.trip?.direction_id,
+                        lat: veh.pos.latitude,
+                        lon: veh.pos.longitude,
+                        bearing: veh.pos.bearing,
+                        seq: veh.seq,
+                    });
+                }
+            }
+            return out;
+        },
+    };
+})();
+
+// shared read of the raw feed: bytes this time, not JSON, de-duplicated
+// like fetchJsonShared and stamped with the file's Last-Modified the same
+// non-enumerable way
+const FETCH_RTT_SHARED = new Map();
+function fetchFeedShared(url, maxAgeMs) {
+    const cached = FETCH_RTT_SHARED.get(url);
+    const now = Date.now();
+    if (cached && now - cached.at < maxAgeMs) return cached.promise;
+    if (FETCH_RTT_SHARED.size > 8) {
+        for (const [k, v] of FETCH_RTT_SHARED) if (now - v.at > 30 * 60000) FETCH_RTT_SHARED.delete(k);
+    }
+    const promise = fetch(url, { cache: "no-cache" }).then(async (r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const lm = Date.parse(r.headers.get("last-modified") || "");
+        const buf = new Uint8Array(await r.arrayBuffer());
+        buf.__lastModified = Number.isFinite(lm) ? lm : undefined;
+        return buf;
+    });
+    FETCH_RTT_SHARED.set(url, { at: now, promise });
+    promise.catch(() => {
+        const cur = FETCH_RTT_SHARED.get(url);
+        if (cur && cur.promise === promise) FETCH_RTT_SHARED.delete(url);
+    });
+    return promise;
+}
+
 const ICONS = {
     // the map's padlock: shut, a view is kept for what is picked; open, the
     // map frames itself and a click keeps the view it shows
@@ -832,6 +999,8 @@ class Gtfs2StopCard extends HTMLElement {
         this._popAnim = null;             // popup glide animation frame
         this._stopLinks = new Map();      // stop name -> Map(line label -> color), rebuilt per render
         this._shownLabels = new Set();    // stop names drawn in full on the map, rebuilt per render
+        this._shapes = new Map();         // route id → its static trip-paths doc (see _tripPath)
+        this._shapeProj = new Map();      // "tripId@x,y" → projected prefix path, per render cycle
         this._panHover = false;           // a view change just closed the tip: hover waits for a real move
         this._timer = null;
         this._anim = null;
@@ -1397,9 +1566,9 @@ class Gtfs2StopCard extends HTMLElement {
             // no vehicles in the editor's preview: it shows the settings,
             // not the traffic
             if (this._preview) continue;
-            // a stop with neither an explicit positions_url nor a route_ids
+            // a stop with no feed, no explicit positions_url and no route_ids
             // mapping for any of its routes has no vehicles to read
-            if (!def.positions_url && !this._positionsUrls(def).length) continue;
+            if (!this._config.positions_feed && !def.positions_url && !this._positionsUrls(def).length) continue;
             // collapsed map only needs the count: poll five times slower
             const mapOff = this._collapsed.map || this._config.show_map === false;
             if (!force && mapOff && slot && Date.now() - (slot.geoAt || 0) < period * 5) continue;
@@ -2760,28 +2929,74 @@ class Gtfs2StopCard extends HTMLElement {
         return out;
     }
 
+    // The raw GTFS-RT feed, read by every stop def at once: decoded once
+    // per refresh, then each stop keeps only the routes its board rides.
+    // Returns null when no feed is configured.
+    async _fetchFeedAll(force) {
+        const url = this._config.positions_feed;
+        if (!url) return null;
+        const maxAge = force ? FETCH_BURST_MS : Math.max(15, this._config.refresh) * 500;
+        const buf = await fetchFeedShared(url, maxAge);
+        const vehs = RT.decode(buf);
+        this._feedAt = Date.now();
+        this._feedLm = buf.__lastModified;
+        return vehs;
+    }
+
     async _fetchPositions(def, force) {
         const slot = this._ld[def.idx];
         if (!slot) return;
         try {
             const maxAge = force ? FETCH_BURST_MS : Math.max(15, this._config.refresh) * 500;
-            // every file the stop's routes are named by, merged into one
-            // FeatureCollection: the map and the join read them as one feed
-            const urls = this._positionsUrls(def);
-            const parts = await Promise.all(urls.map((u) => fetchJsonShared(u, maxAge).catch(() => null)));
-            const feats = [];
-            let lm = Infinity;
+            let feats = [];
             let ok = false;
-            for (const gj of parts) {
-                if (!gj) continue;
-                ok = true;
-                feats.push(...(gj.features || []));
-                const g = gj.__lastModified;
-                if (Number.isFinite(g)) lm = Math.min(lm, g);
+            let lm = Infinity;
+            // the raw feed first: complete for every route and direction,
+            // cut down here to the routes this stop's board rides (the same
+            // route_ids mapping the geojson files are named by)
+            const vehs = await this._fetchFeedAll(force).catch(() => null);
+            if (vehs) {
+                const map = this._config.route_ids && typeof this._config.route_ids === "object" ? this._config.route_ids : {};
+                const want = new Set(Object.values(map).map(String));
+                const routes = new Set();
+                for (const r of this._allRows()) if (r.line != null) routes.add(String(r.line));
+                for (const v of vehs) {
+                    if (want.size && !want.has(String(v.routeId))) continue;
+                    routes.add(String(v.routeId));   // keep mapped routes even off-board
+                    feats.push({
+                        type: "Feature",
+                        geometry: { type: "Point", coordinates: [v.lon, v.lat] },
+                        properties: {
+                            id: `${v.routeId}_${v.directionId}_${v.id}`,
+                            vehicle_id: v.id,
+                            vehicle_label: v.label,
+                            trip_id: v.tripId,
+                            route_id: v.routeId,
+                            direction_id: v.directionId,
+                            bearing: v.bearing,
+                            current_stop_sequence: v.seq,
+                        },
+                    });
+                    const g = this._feedLm;
+                    if (Number.isFinite(g)) lm = Math.min(lm, g);
+                    ok = true;
+                }
+            } else {
+                // no feed configured: the per-route files, merged. Complete
+                // for the directions gtfs2 writes files for
+                const urls = this._positionsUrls(def);
+                const parts = await Promise.all(urls.map((u) => fetchJsonShared(u, maxAge).catch(() => null)));
+                for (const gj of parts) {
+                    if (!gj) continue;
+                    ok = true;
+                    feats.push(...(gj.features || []));
+                    const g = gj.__lastModified;
+                    if (Number.isFinite(g)) lm = Math.min(lm, g);
+                }
             }
             slot.geo = ok ? { type: "FeatureCollection", features: feats } : null;
             slot.geoAt = Date.now();
-            slot.err = ok ? null : (urls.length ? "empty" : null);
+            slot.err = ok ? null : "empty";
             const now = Date.now();
             // Freshness comes from the files' own Last-Modified when the
             // server sends one: the integration rewrites the positions file
@@ -2813,7 +3028,8 @@ class Gtfs2StopCard extends HTMLElement {
             }
         } catch (e) {
             slot.geo = slot.geo || { features: [] };
-            if (slot.err !== String(e)) console.warn(`gtfs2-stop-card: positions fetch failed for ${def.entity || def.idx}`, e);
+            if (slot.err !== String(e)) console.warn(`gtfs2-stop-card: positions fetch failed for ${def.entity || def.idx}`, e,
+                this._config.positions_feed ? `(feed ${this._config.positions_feed})` : "");
             slot.err = String(e);
         }
         // forget vehicles gone from this line's feed for a while. Outside the
@@ -2864,13 +3080,60 @@ class Gtfs2StopCard extends HTMLElement {
         return (EARTH_CIRC * Math.cos((lat * Math.PI) / 180)) / WORLD;
     }
 
-    // Where a vehicle is drawn, and which way it heads: at its fix, always -
-    // the fix is where the vehicle is. What it is on is its line's trip, so
-    // it heads the way its line does at its projection (the loop-aware one
-    // the progress already uses), and that projection is kept for the shape
-    // to bend through it (see _bentRoute). A line with no shape heads from
-    // the last two fixes. All of it kept per vehicle while its fix does not
-    // move.
+    // The static trip paths of one route, as gtfs2's own feed source ships
+    // them (docs/extract_shapes.py wrote them from the GTFS zip: each trip's
+    // ordered stops, TransLink's feed carrying no shapes.txt). Fetched on
+    // first need and kept for the session. Null while loading, false when
+    // the route has no such file.
+    _tripPath(routeId) {
+        if (!routeId) return null;
+        if (this._shapes.has(routeId)) return this._shapes.get(routeId);
+        this._shapes.set(routeId, null);   // loading
+        fetchJsonShared(`/local/gtfs2-static/${safeFilePart(routeId)}_shapes.json`, 60 * 60000)
+            .then((doc) => {
+                this._shapes.set(routeId, doc?.trips ? doc : false);
+                this._scheduleRerender();
+            })
+            .catch(() => this._shapes.set(routeId, false));
+        return null;
+    }
+
+    // A vehicle's "path so far" along its trip's stop polyline: the vehicle
+    // projected onto the sequence, the prefix drawn solid, the remainder
+    // dotted - the schedule's promise ahead, the run's progress behind.
+    // Cached per (trip, position) so a render only projects each vehicle once.
+    _pathSoFar(routeId, tripId, w) {
+        const doc = this._tripPath(routeId);
+        if (!doc || doc === true) return null;
+        const t = doc.trips?.[tripId];
+        if (!t?.pts?.length) return null;
+        const key = `${tripId}@${Math.round(w.x)},${Math.round(w.y)}`;
+        if (this._shapeProj.has(key)) return this._shapeProj.get(key);
+        // project the vehicle onto the polyline: the nearest leg, the point
+        // on it, and how far along the whole sequence that lands
+        const pts = t.pts.map((c) => this._world(c[1], c[0]));
+        let best = null;
+        for (let i = 1; i < pts.length; i++) {
+            const a = pts[i - 1], b = pts[i];
+            const dx = b.x - a.x, dy = b.y - a.y;
+            const len2 = dx * dx + dy * dy;
+            const u = len2 ? Math.max(0, Math.min(1, ((w.x - a.x) * dx + (w.y - a.y) * dy) / len2)) : 0;
+            const px = a.x + u * dx, py = a.y + u * dy;
+            const d2 = (w.x - px) ** 2 + (w.y - py) ** 2;
+            if (!best || d2 < best.d2) best = { d2, i, u, px, py };
+        }
+        if (!best) return null;
+        // the prefix: every vertex up to the projection, then the projected
+        // point itself (and the vehicle snaps to its path there when drawn)
+        const pre = pts.slice(0, best.i);
+        pre.push({ x: best.px, y: best.py });
+        const rest = pts.slice(best.i + 1);
+        const out = { pre, rest, stops: t.names || [] };
+        this._shapeProj.set(key, out);
+        if (this._shapeProj.size > 400) this._shapeProj.clear();
+        return out;
+    }
+
     // Where a vehicle is drawn, and which way it heads. No route shape to
     // project on: the heading is the feed's own bearing when it exports one,
     // else the direction of the last two fixes once the bus has really moved.
@@ -3192,11 +3455,12 @@ class Gtfs2StopCard extends HTMLElement {
             this.shadowRoot.getElementById("focus-panel").innerHTML = "";
             return;
         }
-        // positions are optional: a stop with neither an explicit
+        // positions are optional: a stop with neither a feed, an explicit
         // positions_url nor a route_ids mapping shows its stops alone once
         // it has coordinates
         const defs = this._lineDefs();
-        if (!defs.some((d) => d.positions_url) && !defs.some((d) => this._positionsUrls(d).length)
+        if (!this._config.positions_feed && !defs.some((d) => d.positions_url)
+            && !defs.some((d) => this._positionsUrls(d).length)
             && !defs.some((d) => d.lat != null && d.lon != null)) {
             this._renderMapHead();
             this._clearMap(body, `<div class="empty">${this._t("no_source")}</div>`);
@@ -3284,7 +3548,13 @@ class Gtfs2StopCard extends HTMLElement {
         // the tracking - so the vehicle is in one place for all of them
         for (const e of all) this._placeVeh(e);
 
-        let focusEntry = this._focus ? all.find((e) => e.def.idx === this._focus.li && this._vid(e.f) === this._focus.vid) : null;
+        // the tracked vehicle: on its own def first, else anywhere - two
+        // stops sharing a route read one feed, and the map draws the vehicle
+        // once, for the first stop that lists it
+        let focusEntry = this._focus
+            ? (all.find((e) => e.def.idx === this._focus.li && this._vid(e.f) === this._focus.vid)
+                || all.find((e) => this._vid(e.f) === this._focus.vid))
+            : null;
         if (this._focus && !focusEntry) {
             // tracked vehicle left the feed (end of trip): glide back to the
             // fitted view and say why, instead of jumping silently
@@ -3349,11 +3619,15 @@ class Gtfs2StopCard extends HTMLElement {
             const w = 900 / mPerU, h = w * frameAspect;
             target = [c.x - w / 2, c.y - h * 0.6, w, h];
         } else {
-            // the ground the view covers: the stops and the vehicles shown.
-            // A vehicle far off still draws, off screen until the user pans
-            const stopPts = defs.filter((d) => d.lat != null && d.lon != null)
-                .map((d) => this._world(d.lat, d.lon));
-            const pts = [...stopPts, ...all.map((e) => e.w)];
+            // the ground the view covers: the stops and the vehicles near
+            // them. A vehicle farther out is still drawn, off screen until
+            // the user pans there - the board already says it is coming
+            const stopDefs = defs.filter((d) => d.lat != null && d.lon != null);
+            const stopPts = stopDefs.map((d) => this._world(d.lat, d.lon));
+            const near = (e) => !stopDefs.length || stopDefs.some((d) =>
+                haversine({ lat: d.lat, lon: d.lon },
+                    { lat: e.f.geometry.coordinates[1], lon: e.f.geometry.coordinates[0] }) <= FIT_RADIUS_M);
+            const pts = [...stopPts, ...all.filter(near).map((e) => e.w)];
             let minX = Math.min(...pts.map((p) => p.x)), maxX = Math.max(...pts.map((p) => p.x));
             let minY = Math.min(...pts.map((p) => p.y)), maxY = Math.max(...pts.map((p) => p.y));
             const padX = Math.max((maxX - minX) * 0.12, 300 / mPerU);
@@ -3435,11 +3709,49 @@ class Gtfs2StopCard extends HTMLElement {
         // ── base map: a theme flip or an edited map_style lands here
         this._applyBasemapStyle();
 
-        // ── the vehicles' recent paths: dotted, what the bus was seen along.
-        // No route shapes are drawn: this trail is the only history on the map
+        // ── the vehicles' paths: each run's scheduled stop sequence (from
+        // gtfs2's static feed source) drawn as the path so far - solid up to
+        // the vehicle, dotted ahead - with the live breadcrumbs dotted under.
+        // Only the stretch near the card's stops draws at all: a run that
+        // boarded across town does not drag its morning here, and what is
+        // drawn is loud for the vehicle being read, quiet for the rest
         let routeSvg = "";
         let nextStopName = null;
+        const stopW = defs.filter((d) => d.lat != null && d.lon != null)
+            .map((d) => this._world(d.lat, d.lon));
+        const inRadius = (w) => !stopW.length || stopW.some((s) =>
+            Math.hypot(s.x - w.x, s.y - w.y) * this._mPerUNow <= PATH_RADIUS_M);
+        const runs = (pts) => {
+            const out = [];
+            let run = null;
+            for (const w of pts) {
+                if (inRadius(w)) {
+                    if (!run) run = [];
+                    run.push(w);
+                } else if (run) { out.push(run); run = null; }
+            }
+            if (run) out.push(run);
+            return out.filter((r) => r.length > 1);
+        };
         for (const e of all) {
+            const color = e.def.color || "#0072bc";
+            const active = focusEntry ? focusEntry === e : (topLi == null || e.def.idx === topLi);
+            // the scheduled path of this trip, when its route's static file
+            // has landed: solid behind, dotted ahead
+            const tid = e.f.properties?.trip_id;
+            const rid = e.f.properties?.route_id;
+            const soFar = tid != null ? this._pathSoFar(String(rid), String(tid), e.w) : null;
+            if (soFar) {
+                const line = (pts, dash, op) => `<path d="${pts.map((w, i) => {
+                    const q = rel(w);
+                    return `${i ? "L" : "M"}${q.x.toFixed(3)} ${q.y.toFixed(3)}`;
+                }).join(" ")}" fill="none" stroke="${esc(color)}" stroke-width="${4 * u}"${dash} opacity="${op}" stroke-linecap="round" stroke-linejoin="round"></path>`;
+                for (const run of runs(soFar.pre)) routeSvg += line(run, "", active ? 0.85 : 0.28);
+                for (const run of runs([soFar.pre[soFar.pre.length - 1], ...soFar.rest])) {
+                    routeSvg += line(run, ` stroke-dasharray="${6 * u} ${7 * u}"`, active ? 0.3 : 0.12);
+                }
+            }
+            // the live trail: what the bus was actually seen along
             const key = `${e.def.idx}:${this._vid(e.f)}`;
             const h = this._hist.get(key) || [];
             if (h.length > 1) {
@@ -3447,8 +3759,7 @@ class Gtfs2StopCard extends HTMLElement {
                     const q = rel(this._world(pt.lat, pt.lon));
                     return `${i ? "L" : "M"}${q.x.toFixed(3)} ${q.y.toFixed(3)}`;
                 }).join(" ");
-                const active = focusEntry ? focusEntry === e : (topLi == null || e.def.idx === topLi);
-                routeSvg += `<path d="${d}" fill="none" stroke="${esc(e.def.color || "#0072bc")}" stroke-width="${3 * u}" stroke-dasharray="${6 * u} ${6 * u}" opacity="${active ? 0.45 : 0.15}" stroke-linecap="round"></path>`;
+                routeSvg += `<path d="${d}" fill="none" stroke="${esc(color)}" stroke-width="${3 * u}" stroke-dasharray="${6 * u} ${6 * u}" opacity="${active ? 0.45 : 0.15}" stroke-linecap="round"></path>`;
             }
         }
 
@@ -3513,7 +3824,21 @@ class Gtfs2StopCard extends HTMLElement {
             const def = e.def;
             const vid = this._vid(e.f);
             const c = rel(e.w);
-            const angle = e.angle;
+            let angle = e.angle;
+            // a trip whose scheduled path is on the map says its heading
+            // outright: the way the path runs at the vehicle's projection -
+            // correct on the first frame, where the feed (TransLink's carries
+            // no bearing) and the fix history would need minutes to answer
+            const tid = e.f.properties?.trip_id;
+            const soFar = tid != null
+                ? this._pathSoFar(String(e.f.properties?.route_id), String(tid), e.w) : null;
+            if (soFar && soFar.pre.length > 1) {
+                const a = soFar.pre[soFar.pre.length - 2], b = soFar.pre[soFar.pre.length - 1];
+                if (Math.hypot(b.x - a.x, b.y - a.y) * this._mPerUNow > 10
+                    && Math.hypot(b.x - e.w.x, b.y - e.w.y) * this._mPerUNow < 150) {
+                    angle = (Math.atan2(b.x - a.x, -(b.y - a.y)) * 180) / Math.PI;
+                }
+            }
             const focused = focusEntry === e;
             const dim = !focused && topLi != null && def.idx !== topLi;
             // labels only where they stay readable: tracked bus, highlighted
