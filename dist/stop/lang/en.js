@@ -168,6 +168,7 @@ export default {
         sec_map: "Map",
         j_over: "Line settings",
         map_style: "Map style",
+        layout: "Layout: board and map side by side, or stacked",
         map_aspect: "Map aspect ratio (e.g. 4/3)",
         stop_color: "Stop marker color",
         latitude: "Station latitude (empty = located on the route)",

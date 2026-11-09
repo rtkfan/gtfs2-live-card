@@ -1,6 +1,6 @@
 // Based on gtfs2-live-card by Pulpyyyy (MIT), modified for gtfs2
 // local-stop sensors. See LICENSE.
-const CARD_VERSION = "0.1.16";
+const CARD_VERSION = "0.1.21";
 
 console.info(
     `%c 🚏 GTFS2 Stop Card %c v${CARD_VERSION} %c`,
@@ -50,6 +50,7 @@ const DEFAULTS = {
     // a departures-only card in a column, a map-only card next to it.
     show_departures: true,    // the departures pane, its header included
     show_map: true,           // the map pane, its header included
+    layout: null,             // "split": the board left, the map right, one tile
     map_style: "auto",        // auto | light | dark | custom template with {z}/{x}/{y}
     map_aspect: null,         // e.g. "4/3", overrides the responsive default
     latitude: null,           // optional map-center fallback (the stop markers use the sensor's own)
@@ -1497,6 +1498,12 @@ class Gtfs2StopCard extends HTMLElement {
         if (this._mapDomReady && !this._map) this._buildBasemap();
         this._startPolling();
         if (!this._tick30) this._tick30 = setInterval(() => this._tickRelative(), 30000);
+        if (!this._winResize) {
+            // the split tile pins itself to the window: the header Home
+            // Assistant shows and hides changes what is left for the card
+            this._winResize = () => this._sizeSplit();
+            window.addEventListener("resize", this._winResize);
+        }
         // Home Assistant re-attaches a view's elements as they were left, and
         // the hass setter redraws nothing unless the sensor changed meanwhile:
         // the countdowns, expired rows and footer catch up now, not 30 s later
@@ -1525,6 +1532,7 @@ class Gtfs2StopCard extends HTMLElement {
         if (this._tick30) { clearInterval(this._tick30); this._tick30 = null; }
         if (this._visHandler) { document.removeEventListener("visibilitychange", this._visHandler); this._visHandler = null; }
         if (this._keyHandler) { document.removeEventListener("keydown", this._keyHandler); this._keyHandler = null; }
+        if (this._winResize) { window.removeEventListener("resize", this._winResize); this._winResize = null; }
         if (this._ro) { this._ro.disconnect(); this._ro = null; }
         if (this._anim) cancelAnimationFrame(this._anim);
         if (this._rerenderTimer) { clearTimeout(this._rerenderTimer); this._rerenderTimer = null; }
@@ -1587,7 +1595,7 @@ class Gtfs2StopCard extends HTMLElement {
                 this._lastW = w;
                 this._scaleW = 0;              // cached map box, re-measured on the next render
                 this._scaleH = 0;
-                if (!this._collapsed.map && this._mapDomReady) this._scheduleRerender();
+                if ((!this._collapsed.map || this._config.layout === "split") && this._mapDomReady) this._scheduleRerender();
             }
         });
         this._ro.observe(body);
@@ -1596,6 +1604,7 @@ class Gtfs2StopCard extends HTMLElement {
     // 30 s heartbeat keeping relative texts honest between data refreshes
     _tickRelative() {
         if (document.hidden || !this._built) return;
+        this._sizeSplit();
         // expanded board: refresh the countdown texts in place; a full
         // re-render only when a row expired (or the board is collapsed and
         // its one-line summary is cheap to rebuild)
@@ -1631,9 +1640,16 @@ class Gtfs2StopCard extends HTMLElement {
     /* ── LOVELACE API ───────────────────────────────────────────────────── */
 
     getCardSize() {
+        // the size reads the config alone: _isSplit also asks the sensors,
+        // and a card not yet fed them must still reserve its rows
+        const split = this._config.layout === "split"
+            && this._config.show_departures !== false && this._config.show_map !== false;
         return 1
             + (this._config.show_departures === false ? 0 : (this._collapsed.dep ? 1 : 3))
-            + (this._config.show_map === false ? 0 : (this._collapsed.map ? 1 : 4));
+            + (this._config.show_map === false ? 0
+                // split: the map shares the board's height, it adds none
+                : split ? 3
+                : (this._collapsed.map ? 1 : 4));
     }
 
     static getConfigElement() {
@@ -1701,6 +1717,34 @@ class Gtfs2StopCard extends HTMLElement {
 
     /* ── SHELL ──────────────────────────────────────────────────────────── */
 
+    // split wants a board and a map both: a pane hidden by config puts the
+    // card back in the stacked flow, the only shape a half card has.
+    // The viewport is not consulted here: getCardSize must not swing with
+    // the window, and the narrow-screen fallback is the stylesheet's media
+    // query, which drops the split grid under 840 px on its own
+    _isSplit() {
+        return this._config.layout === "split"
+            && this._config.show_departures !== false
+            && this._config.show_map !== false
+            && !!this._depSources().length;
+    }
+
+    // the split tile's height: the window less whatever sits above the card
+    // (Home Assistant's header, the view's margins), measured rather than
+    // guessed, so the board column scrolls and the map beside it never
+    // changes size as rows come and go. Written as a custom property on the
+    // host; the card's stylesheet reads it (--split-h). Re-measured on every
+    // window resize, and cheap enough to run on the 30 s tick as well - the
+    // header can appear or disappear without a resize event.
+    _sizeSplit() {
+        if (!this._isSplit()) return;
+        try {
+            const r = this.getBoundingClientRect();
+            const h = Math.max(360, (window.innerHeight || 800) - r.top - 8);
+            this.style.setProperty("--split-h", `${h}px`);
+        } catch (e) { /* off document: the fallback height stands */ }
+    }
+
     _buildShell() {
         this._dropBasemap();              // its container goes with the old shell
         // card-mod puts its <card-mod> element in this shadow root once,
@@ -1711,7 +1755,7 @@ class Gtfs2StopCard extends HTMLElement {
         this.shadowRoot.innerHTML = `
         <link rel="stylesheet" href="${MAPLIBRE_CSS}">
         <style>${this._styles()}</style>
-        <ha-card>
+        <ha-card class="${this._isSplit() ? "split" : ""}">
             <div id="header" class="header"></div>
             <div id="dep-head" class="sect-head" data-action="toggle-dep" role="button" tabindex="0"></div>
             <div id="dep-body"></div>
@@ -1729,6 +1773,7 @@ class Gtfs2StopCard extends HTMLElement {
         this._renderMapSection();
         this._renderFooter();
         this._observeResize();
+        this._sizeSplit();
     }
 
     _activate(t) {
@@ -1898,7 +1943,7 @@ class Gtfs2StopCard extends HTMLElement {
             this._persistCollapsed();
             this._renderHeader();
             this._renderDepartures();
-            if (!this._collapsed.map) this._renderMap(true);
+            if (!this._collapsed.map || this._config.layout === "split") this._renderMap(true);
         } else if (action === "line") {
             const li = Number(ds.li);
             this._hiLine = this._hiLine === li ? null : li;
@@ -1911,7 +1956,7 @@ class Gtfs2StopCard extends HTMLElement {
             this._manual = false;
             this._renderHeader();
             this._renderDepartures();
-            if (!this._collapsed.map) this._renderMap(true);
+            if (!this._collapsed.map || this._config.layout === "split") this._renderMap(true);
         } else if (action === "dest-from" || action === "dest" || action === "dest-way" || action === "dest-clear") {
             // the destination header: the departure, an arrival, a way to
             // leave. Each is the user's own choice, the last two toggles, each
@@ -1942,7 +1987,7 @@ class Gtfs2StopCard extends HTMLElement {
             this._activeJourney = null;
             this._renderHeader();
             this._renderDepartures();
-            if (!this._collapsed.map) this._renderMap(true);
+            if (!this._collapsed.map || this._config.layout === "split") this._renderMap(true);
         } else if (action === "stop") {
             // tap on a stop: name and connections for two seconds, unless the
             // map already says it all - the tip would print the same words
@@ -3443,8 +3488,13 @@ class Gtfs2StopCard extends HTMLElement {
             return;
         }
         head.style.display = "";
-        head.setAttribute("aria-expanded", String(!this._collapsed.map));
-        if (this._collapsed.map) {
+        // split hides the map's header row in CSS (ha-card.split > #map-head),
+        // not here: an inline display would beat the narrow-screen media
+        // query, which needs the row back for the stacked fallback. Split
+        // also ignores _collapsed.map - the column has no header to collapse
+        // with, so the flag stands back rather than blanking it
+        head.setAttribute("aria-expanded", String(!this._collapsed.map || this._config.layout === "split"));
+        if (this._collapsed.map && this._config.layout !== "split") {
             const count = this._liveBusCount();
             const stale = this._feedStaleAge();
             const summary = stale
@@ -3459,6 +3509,10 @@ class Gtfs2StopCard extends HTMLElement {
             this.shadowRoot.getElementById("focus-panel").innerHTML = "";
             return;
         }
+        // split: the hidden header row still gets its content, so the
+        // narrow-screen fallback (the media query un-hides the row) shows a
+        // live summary, not an empty strip
+        if (this._config.layout === "split") this._renderMapHead();
         // positions are optional: a stop with neither a feed, an explicit
         // positions_url nor a route_ids mapping shows its stops alone once
         // it has coordinates
@@ -4990,6 +5044,63 @@ class Gtfs2StopCard extends HTMLElement {
             .board:not(.jboard) .vias, .board:not(.jboard) .dest-c, .board:not(.jboard) .note-c > * { display: none; }
             .board:not(.jboard) tr.row-sub { display: table-row; }
         }
+        /* ── split layout: the board left, the map right, one tile ──────────
+           The frame wants the board's own height, not an aspect ratio, so
+           the grid's rows are sized by column 1 and the map fills the tile:
+           a tall board is a tall map, a short one a short map. The SVG is
+           absolutely positioned in its wrap rather than flowing, or its
+           aspect-ratio rule would set the grid row's height through the
+           frame. The map's own header row disappears - the pane is a
+           column, not a section - and the map spans the board's rows from
+           the title down, the footer ruling under both columns. The class
+           is only ever set when both panes exist (see _buildShell), so a
+           map-only or board-only card keeps the stacked flow. The whole
+           thing falls back to the stacked layout under 840 px - a tile
+           that narrow is a phone, and there the stacked card is the right
+           shape.
+           The tile's height is pinned to the window (_sizeSplit measures
+           the card's own offset, HA's header included) and the board's
+           rows scroll inside column 1: the map keeps its size however many
+           stops, rows or alerts come and go on the left. The 1fr row is
+           the board's, minmax(0, 1fr) so the table can shrink to it and
+           overflow rather than push. */
+        ha-card.split {
+            display: grid;
+            grid-template-columns: minmax(340px, 1fr) minmax(280px, 1fr);
+            grid-template-rows: auto auto minmax(0, 1fr) auto;
+            height: var(--split-h, calc(100dvh - 100px));
+        }
+        ha-card.split > #header { grid-column: 1; grid-row: 1; min-width: 0; }
+        ha-card.split > #dep-head { grid-column: 1; grid-row: 2; min-width: 0; }
+        /* the map column has no header row of its own: hidden here rather
+           than by an inline style, so the narrow-screen media query below
+           can give it back when the card falls back to the stacked flow */
+        ha-card.split > #map-head { display: none; }
+        ha-card.split > #dep-body { grid-column: 1; grid-row: 3; min-width: 0; overflow-y: auto; overscroll-behavior: contain; }
+        ha-card.split > #focus-panel { grid-column: 1; grid-row: 3; min-width: 0; pointer-events: none; }
+        /* the panel shares row 3 with the board and paints over it: empty
+           space must let the wheel (and the cursor) through to the board's
+           scroller, only its real content - a tracking popup - takes
+           pointers back */
+        ha-card.split > #focus-panel > * { pointer-events: auto; }
+        ha-card.split > #map-body { grid-column: 2; grid-row: 1 / span 3; min-height: 320px; position: relative; border-top: none; }
+        ha-card.split > #map-body .map-wrap { position: absolute; inset: 0; }
+        ha-card.split > #map-body .map-wrap svg { position: absolute; inset: 0; width: 100%; height: 100%; aspect-ratio: auto; }
+        ha-card.split > #footer { grid-column: 1 / -1; grid-row: 4; border-top: 1px solid var(--divider-color); }
+        @media (max-width: 840px) {
+            ha-card.split { display: block; height: auto; }
+            /* the split column's scroller must not survive the fallback:
+               overflow-y auto keeps dep-body a scroll container even with
+               nothing to scroll, and its overscroll-behavior contain then
+               swallows the wheel/touch at that point - on a dashboard whose
+               scroller is not the viewport the page never receives the
+               gesture (the header, with no such container, scrolled fine) */
+            ha-card.split > #dep-body { overflow: visible; overscroll-behavior: auto; }
+            ha-card.split > #map-head { display: flex; }
+            ha-card.split > #map-body { min-height: 0; }
+            ha-card.split > #map-body .map-wrap { position: relative; inset: auto; }
+            ha-card.split > #map-body .map-wrap svg { position: relative; inset: auto; height: auto; aspect-ratio: 2 / 1; }
+        }
         .info-strip { display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 16px; border-top: 1px solid var(--divider-color); }
         .info-chip { display: inline-flex; align-items: center; gap: 5px; padding: 3px 8px; border-radius: 8px; font-size: 11px; background: rgba(127,127,127,.12); color: var(--secondary-text-color); }
         .info-chip svg { flex: none; }
@@ -5001,6 +5112,10 @@ class Gtfs2StopCard extends HTMLElement {
         .empty.rest::first-letter { text-transform: uppercase; }
         .empty code { font-size: 12px; }
         .map-body { border-top: 0; container-type: inline-size; }
+        /* split: the map column runs the card's full height beside the
+           board, so it carries the divider on its left, not on its top -
+           there is no header row above it to rule under */
+        ha-card.split .map-body { border-top: none; border-left: 1px solid var(--divider-color); }
         .map-wrap { position: relative; background: var(--gtfs2-map-background, rgba(127,127,127,.1)); user-select: none; }
         /* the base map canvas fills the frame under the SVG, which keeps
            every pointer: MapLibre is not interactive, the card's gestures are */
@@ -5118,6 +5233,9 @@ class Gtfs2StopCardEditor extends HTMLElement {
         if (id === "gen") return [
             { name: "title", selector: { text: {} } },
             { name: "mode_icons", selector: { boolean: {} } },
+            ...(c.show_departures === false || c.show_map === false ? []
+                : [{ name: "layout", selector: { select: { mode: "dropdown", options: [
+                    { value: "stacked", label: "stacked" }, { value: "split", label: "split" }] } } }]),
         ];
         if (id === "dep") return [
             { name: "show_departures", selector: { boolean: {} } },
@@ -5147,6 +5265,7 @@ class Gtfs2StopCardEditor extends HTMLElement {
         if (id === "gen") return {
             title: c.title ?? "",
             mode_icons: c.mode_icons !== false,
+            layout: c.layout ?? "stacked",
         };
         if (id === "dep") return {
             show_departures: c.show_departures !== false,
@@ -5343,6 +5462,10 @@ class Gtfs2StopCardEditor extends HTMLElement {
         assign("refresh", false);
         assign("map_style", true);
         assign("map_aspect", false);
+        assign("layout", false);
+        // stacked is the default: the key leaves the YAML rather than saying
+        // what its absence already says
+        if (has("layout") && (v.layout === "stacked" || v.layout == null || v.layout === "")) delete c.layout;
         assign("stop_color", false);
         for (const k of ["latitude", "longitude"]) {
             if (!has(k)) continue;
@@ -5355,7 +5478,9 @@ class Gtfs2StopCardEditor extends HTMLElement {
             if (v[k] === false) c[k] = false; else delete c[k];
         }
         this._emit();
-        // a pane switched on or off shows or hides its options
+        // a pane switched on or off shows or hides its options, and the
+        // layout select lives with them: hide a pane and the card is
+        // stacked whatever the YAML once said
         if (has("show_departures") || has("show_map")) this._render();
     }
 

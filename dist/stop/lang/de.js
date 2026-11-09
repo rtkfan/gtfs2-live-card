@@ -167,6 +167,7 @@ export default {
         sec_map: "Karte",
         j_over: "Linieneinstellungen",
         map_style: "Kartenstil",
+        layout: "Anordnung: Tafel und Karte nebeneinander oder untereinander",
         map_aspect: "Seitenverhältnis der Karte (z. B. 4/3)",
         stop_color: "Farbe der Haltestellenmarkierung",
         latitude: "Breitengrad der Station (leer = auf der Route)",

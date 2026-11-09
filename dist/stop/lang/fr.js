@@ -167,6 +167,7 @@ export default {
         sec_map: "Carte",
         j_over: "Réglages de la ligne",
         map_style: "Style de carte",
+        layout: "Disposition : tableau et carte côte à côte, ou empilés",
         map_aspect: "Proportions de la carte (ex. 4/3)",
         stop_color: "Couleur du marqueur d'arrêt",
         latitude: "Latitude de la station (vide = située sur le tracé)",

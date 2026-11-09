@@ -167,6 +167,7 @@ export default {
         sec_map: "Mapa",
         j_over: "Definições da linha",
         map_style: "Estilo do mapa",
+        layout: "Disposição: painel e mapa lado a lado, ou empilhados",
         map_aspect: "Proporção do mapa (ex. 4/3)",
         stop_color: "Cor do marcador de paragem",
         latitude: "Latitude da estação (vazio = situada no traçado)",

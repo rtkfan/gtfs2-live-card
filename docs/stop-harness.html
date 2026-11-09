@@ -134,7 +134,8 @@ customElements.define("ha-form", HaForm);
 class HaCard extends HTMLElement {
   connectedCallback() {
     const s = this.style;
-    s.display = "block";
+    // no inline display: the card's own stylesheet must be free to turn the
+    // element into a grid (layout: split), and an inline style would beat it
     s.background = "var(--card-background-color)";
     s.borderRadius = "var(--ha-card-border-radius, 12px)";
     s.border = "1px solid var(--ha-card-border-color, rgba(0,0,0,0.12))";
@@ -414,6 +415,8 @@ if (page === "rtprobe") {
   });
 } else if (page === "board") {
   card({ ...base, show_map: false }, "board only", 470);
+} else if (page === "split") {
+  card({ ...base, layout: "split", map_aspect: "4/3" }, "split: board left, map right", 900);
 } else if (page === "map") {
   card({ ...base, show_departures: false, map_aspect: "4/3" }, "map only", 470);
 } else if (page === "nearby") {
