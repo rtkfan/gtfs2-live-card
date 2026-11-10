@@ -31,7 +31,7 @@ $card = Join-Path $dist "gtfs2-stop-card.js"
 if (-not (Test-Path $card)) { throw "card not found: $card" }
 
 # the card's own version: the cache-buster the resource URL carries
-$version = if ((Get-Content $card -TotalCount 1) -match 'CARD_VERSION\s*=\s*"([^"]+)"') { $Matches[1] } else { "0" }
+$version = if ((Get-Content $card -TotalCount 5) -match 'CARD_VERSION\s*=\s*"([^"]+)"') { $Matches[1] } else { "0" }
 
 $remote = "/config/www/gtfs2-stop-card"
 Write-Host "Deploying gtfs2-stop-card v$version -> ${HaUser}@${HaHost}:$remote"

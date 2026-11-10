@@ -1,6 +1,6 @@
 // Based on gtfs2-live-card by Pulpyyyy (MIT), modified for gtfs2
 // local-stop sensors. See LICENSE.
-const CARD_VERSION = "0.1.21";
+const CARD_VERSION = "0.1.22";
 
 console.info(
     `%c 🚏 GTFS2 Stop Card %c v${CARD_VERSION} %c`,
@@ -941,6 +941,8 @@ class Gtfs2StopCard extends HTMLElement {
         this._focus = null;               // {li, vid} of the tracked vehicle, or null
         this._trackAt = 0;                // when a click last started tracking one
         this._hiLine = null;              // line idx highlighted from its header badge
+        this._hiRoute = null;             // route code picked: one badge stands for it,
+                                          // a stop's code list often holds several
         // the destination header of a card of journeys: the departure picked
         // (its placeKey), the arrival picked (its group key) and the way to
         // leave picked (a sensor, or "direct:" and a sensor), remembered per
@@ -1479,8 +1481,9 @@ class Gtfs2StopCard extends HTMLElement {
         if (this._trackPrev === undefined) return;
         const prev = this._trackPrev;
         this._trackPrev = undefined;
-        if (this._hiLine === prev) return;
-        this._hiLine = prev;
+        if (this._hiLine === prev.li && this._hiRoute === prev.route) return;
+        this._hiLine = prev.li;
+        this._hiRoute = prev.route;
         this._renderHeader();
         this._renderDepartures();
     }
@@ -1852,8 +1855,9 @@ class Gtfs2StopCard extends HTMLElement {
             this._focus = { li, vid: this._vid(f) };
             this._manual = false;
             if (this._hiLine !== li) {
-                if (this._trackPrev === undefined) this._trackPrev = this._hiLine;
+                if (this._trackPrev === undefined) this._trackPrev = { li: this._hiLine, route: this._hiRoute };
                 this._hiLine = li;
+                this._hiRoute = null;
                 this._renderHeader();
             }
             this._renderDepartures();
@@ -1867,8 +1871,9 @@ class Gtfs2StopCard extends HTMLElement {
             // departures filter and map, one consistent context
             if (this._hiLine !== li) {
                 // the filter the tracking replaces, given back when it ends
-                if (this._trackPrev === undefined) this._trackPrev = this._hiLine;
+                if (this._trackPrev === undefined) this._trackPrev = { li: this._hiLine, route: this._hiRoute };
                 this._hiLine = li;
+                this._hiRoute = null;
                 this._renderHeader();
                 this._renderDepartures();
             }
@@ -1891,8 +1896,9 @@ class Gtfs2StopCard extends HTMLElement {
             this._manual = false;
             this._trackPrev = undefined;
             const picked = this._dest != null || this._way != null;
-            if (this._hiLine != null || picked) {
+            if (this._hiLine != null || this._hiRoute != null || picked) {
                 this._hiLine = null;
+                this._hiRoute = null;
                 if (picked) {
                     this._dest = null;
                     this._way = null;
@@ -1934,6 +1940,7 @@ class Gtfs2StopCard extends HTMLElement {
             if (m === this._modeOf()) return;
             this._modePick = m;
             this._hiLine = null;
+            this._hiRoute = null;
             this._dest = null;
             this._way = null;
             this._activeJourney = null;
@@ -1946,7 +1953,13 @@ class Gtfs2StopCard extends HTMLElement {
             if (!this._collapsed.map || this._config.layout === "split") this._renderMap(true);
         } else if (action === "line") {
             const li = Number(ds.li);
-            this._hiLine = this._hiLine === li ? null : li;
+            // one badge per route code: the pick is the code, the stop it
+            // rode in on only a place to look up its departures. Two routes
+            // sharing a stop keep their picks apart
+            const route = ds.route || null;
+            const same = this._hiRoute === route && this._hiLine === li;
+            this._hiLine = same ? null : li;
+            this._hiRoute = same ? null : route;
             this._trackPrev = undefined;   // the user's own pick now
             // a badge click (select or deselect) always resets the map: the
             // tracking is released, a manual pan/zoom is forgotten, and the
@@ -1981,6 +1994,7 @@ class Gtfs2StopCard extends HTMLElement {
             }
             this._persistCollapsed();
             this._hiLine = null;
+            this._hiRoute = null;
             this._trackPrev = undefined;
             this._focus = null;
             this._manual = false;
@@ -2184,9 +2198,14 @@ class Gtfs2StopCard extends HTMLElement {
         const badges = [...routeOf.entries()]
             .map(([label, d]) => {
                 const s = this._badgeState(d);
-                const sel = !!picked && ((picked.codes || [picked.label]).includes(label));
-                const dim = this._hiLine != null && !sel;
-                const a11y = many ? ` data-action="line" data-li="${d.idx}" data-fk="line:${d.idx}" role="button" tabindex="0" aria-pressed="${sel}"` : "";
+                // one badge per route code: the pick is the code itself, so
+                // two routes sharing a stop light up apart. While a vehicle
+                // is tracked (route unset, its stop's line picked) the stop's
+                // badges light as they always did
+                const sel = this._hiRoute != null ? label === this._hiRoute
+                    : picked != null ? (picked.codes || [picked.label]).includes(label) : false;
+                const dim = (this._hiRoute != null || picked != null) && !sel;
+                const a11y = many ? ` data-action="line" data-li="${d.idx}" data-route="${esc(label)}" data-fk="line:${esc(label)}" role="button" tabindex="0" aria-pressed="${sel}"` : "";
                 const bfs = badgeFontSize(label, this._badgeFamily());
                 const marks = s.restSr + s.chip + s.mutePip + s.alertPip + s.rest;
                 // the route's own colour, drained like the stop's when it is out of service
@@ -2447,7 +2466,9 @@ class Gtfs2StopCard extends HTMLElement {
         for (const src of this._depSources()) rows.push(...this._sourceRows(src));
         // a route picked by tapping its badge filters the board to that
         // route, across every stop the card holds
-        if (this._hiLine != null) {
+        if (this._hiRoute != null) {
+            rows = rows.filter((r) => r.line === this._hiRoute);
+        } else if (this._hiLine != null) {
             const hd = this._lineDefs().find((x) => x.idx === this._hiLine);
             const want = hd ? (hd.codes || [hd.label]) : null;
             if (want) rows = rows.filter((r) => want.includes(r.line));
@@ -2618,8 +2639,8 @@ class Gtfs2StopCard extends HTMLElement {
         // the picked line in the section head is also how to drop the pick:
         // a second tap on the header badge was the only way back, unsaid
         const clear = esc(this._t("clear_filter"));
-        const filterBadge = hiDef ? ` <span class="mini-badge filter" style="background:${esc(hiDef.color)};color:${inkOn(hiDef.color)}" data-action="line" data-li="${hiDef.idx}"`
-            + ` role="button" tabindex="0" title="${clear}" aria-label="${clear}">${esc(this._lineLabelOf(hiDef))}<span class="x" aria-hidden="true">×</span></span>`
+        const filterBadge = hiDef ? ` <span class="mini-badge filter" style="background:${esc(hiDef.color)};color:${inkOn(hiDef.color)}" data-action="line" data-li="${hiDef.idx}" data-route="${esc(this._hiRoute ?? "")}"`
+            + ` role="button" tabindex="0" title="${clear}" aria-label="${clear}">${esc(this._hiRoute ?? this._lineLabelOf(hiDef))}<span class="x" aria-hidden="true">×</span></span>`
             : "";
         const { rows, multi } = this._departureRows();
         // the run of the vehicle tracked on the map lights up on the board
@@ -3622,6 +3643,13 @@ class Gtfs2StopCard extends HTMLElement {
         const cmap = this._config.route_ids && typeof this._config.route_ids === "object" ? this._config.route_ids : {};
         for (const [code, rid] of Object.entries(cmap)) revColor.set(String(rid), code);
         const vehColor = (e) => {
+            const col = vehCodeCol(e)?.col || e.def.color || "#0072bc";
+            return col;
+        };
+        // a vehicle's route code and its colour, worked out together: the
+        // dimming below needs the code (two stops sharing a route must not
+        // dim each other's vehicles) and the paint needs the colour
+        const vehCodeCol = (e) => {
             const tid = e.f.properties?.trip_id != null ? String(e.f.properties.trip_id) : null;
             const code = (tid != null && byTrip.get(tid)) || revColor.get(String(e.f.properties?.route_id ?? "")) || null;
             // a vehicle can be attached to a def whose own departures don't
@@ -3632,7 +3660,7 @@ class Gtfs2StopCard extends HTMLElement {
             // so read the codeColors maps directly
             let col = code && e.def.codeColors?.get(code);
             for (let i = 0; !col && i < defs.length; i++) col = code && defs[i].codeColors?.get(code);
-            return col || e.def.color || "#0072bc";
+            return code ? { code, col } : { code: null, col: null };
         };
         // the popup reads it too, through _renderMap's closure on _mapPaint
         this._vehColorOf = vehColor;
@@ -3657,6 +3685,11 @@ class Gtfs2StopCard extends HTMLElement {
         // the "top" line: the focused bus's line, else the line picked by
         // tapping its badge; the lines it leaves out step back
         const topLi = focusEntry ? focusEntry.def.idx : (this._hiLine ?? this._destTopLi());
+        // the route code the pick stands for, when there is one: the map's
+        // dimming works on codes, not stops
+        const hiDef = this._hiLine != null ? defs.find((x) => x.idx === this._hiLine) : null;
+        const hiRouteCode = this._hiRoute ?? (hiDef ? (hiDef.codes?.[0] ?? this._lineLabelOf(hiDef)) : null);
+        const topRoute = topLi != null ? hiRouteCode : null;
         const dset = this._destLines();
         // the stop card shows the vehicles of the departures on the board
         // and no others (see _stopVehicleFilter); a tracked vehicle shows
@@ -3824,7 +3857,7 @@ class Gtfs2StopCard extends HTMLElement {
         };
         for (const e of all) {
             const color = vehColor(e);
-            const active = focusEntry ? focusEntry === e : (topLi == null || e.def.idx === topLi);
+            const active = focusEntry ? focusEntry === e : (topRoute == null || vehCodeCol(e).code === topRoute);
             // the scheduled path of this trip, when its route's static file
             // has landed: solid behind, dotted ahead
             const tid = e.f.properties?.trip_id;
@@ -3906,8 +3939,8 @@ class Gtfs2StopCard extends HTMLElement {
         // CSS transition instead of jumping at every refresh
         const busOrder = topLi == null ? all
             : [...all].sort((a, b) =>
-                ((a.def.idx === topLi ? 1 : 0) + (a === focusEntry ? 1 : 0)) -
-                ((b.def.idx === topLi ? 1 : 0) + (b === focusEntry ? 1 : 0)));
+                ((vehCodeCol(a).code === topRoute ? 1 : 0) + (a === focusEntry ? 1 : 0)) -
+                ((vehCodeCol(b).code === topRoute ? 1 : 0) + (b === focusEntry ? 1 : 0)));
         const vehicles = [];
         for (const e of busOrder) {
             const def = e.def;
@@ -3929,10 +3962,14 @@ class Gtfs2StopCard extends HTMLElement {
                 }
             }
             const focused = focusEntry === e;
-            const dim = !focused && topLi != null && def.idx !== topLi;
+            // stepping back is by route code, not by the stop the vehicle was
+            // attached to: two stops sharing a route draw each other's buses,
+            // and the picked route's own vehicles must stay lit on both
+            const vehCode = vehCodeCol(e).code;
+            const dim = !focused && topRoute != null && vehCode != null && vehCode !== topRoute;
             // labels only where they stay readable: tracked bus, highlighted
             // line, or an overview span tight enough not to turn into soup
-            const showLabel = focused || (topLi != null ? def.idx === topLi : spanM < 6000);
+            const showLabel = focused || (topRoute != null ? vehCode === topRoute : spanM < 6000);
             // the disc carries an upright mode glyph, the heading rides on a
             // separate arrow orbiting its rim: a rotating glyph would read
             // upside down as soon as the vehicle runs southwards.
